@@ -1393,7 +1393,7 @@ fn execute_cancel_circle(
 }
 
 fn execute_update_circle(
-    mut deps: DepsMut,
+    deps: DepsMut,
     env: Env,
     info: MessageInfo,
     circle_id: u64,
@@ -1746,7 +1746,7 @@ fn execute_distribute_blocked_funds(
     circle_id: u64,
     cycle: u32,
 ) -> Result<Response, ContractError> {
-    let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
 
     // Only creator/admin can trigger distribution
     if info.sender != circle.creator_address {

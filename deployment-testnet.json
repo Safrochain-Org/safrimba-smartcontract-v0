@@ -1,11 +1,11 @@
 {
   "network": "testnet",
   "chainId": "safro-testnet-1",
-  "codeId": "73",
-  "adminAddress": "addr_safro1x25weznnzd5k6jv663sdldehqwcjatc44gvrvq",
+  "codeId": "74",
+  "adminAddress": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
   "platformFeePercent": 100,
-  "platformAddress": "addr_safro1x25weznnzd5k6jv663sdldehqwcjatc44gvrvq",
-  "deployedAt": "2025-11-16T16:48:26Z",
+  "platformAddress": "addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn",
+  "deployedAt": "2026-01-27T08:40:56Z",
   "wasmFile": "safrimba_contract.wasm",
   "note": "Contract instances will be created by the frontend for each circle"
 }

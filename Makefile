@@ -18,16 +18,24 @@ optimize:
 	fi
 
 # Alternative: Optimize using local wasm-opt if available
+# NOTE: Safrochain's wasmvm v0.54.0 does NOT support bulk memory
+# Use two-pass optimization: first lower bulk memory, then optimize
 optimize-local:
 	@mkdir -p artifacts
 	@if command -v wasm-opt >/dev/null 2>&1; then \
-		echo "Optimizing with wasm-opt (stripping reference-types)..."; \
-		wasm-opt -Os --strip-debug --strip-producers --disable-reference-types \
+		echo "Warning: Using wasm-opt (Safrochain wasmvm v0.54.0 does NOT support bulk memory)"; \
+		echo "Step 1: Lowering memory.copy/memory.fill operations..."; \
+		wasm-opt --enable-bulk-memory --llvm-memory-copy-fill-lowering \
 			target/wasm32-unknown-unknown/release/safrimba_contract.wasm \
-			-o artifacts/safrimba_contract.wasm; \
-		echo "Optimization complete"; \
+			-o artifacts/temp_optimized.wasm && \
+		echo "Step 2: Optimizing and removing reference-types..."; \
+		wasm-opt -Os --strip-debug --strip-producers --disable-reference-types \
+			artifacts/temp_optimized.wasm \
+			-o artifacts/safrimba_contract.wasm && \
+		rm -f artifacts/temp_optimized.wasm && \
+		echo "Optimization complete - bulk memory operations lowered"; \
 	else \
-		echo "Error: wasm-opt not found. Install binaryen package."; \
+		echo "Error: wasm-opt not found. Install binaryen package or use 'make optimize' (Docker)."; \
 		exit 1; \
 	fi
 

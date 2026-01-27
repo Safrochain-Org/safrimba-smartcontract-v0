@@ -10,8 +10,8 @@ NC='\033[0m' # No Color
 
 # Default values
 NETWORK="${1:-testnet}"
-KEY_NAME="${2:-mycontractadmin}"
-ADMIN_ADDRESS="${3:-addr_safro1x25weznnzd5k6jv663sdldehqwcjatc44gvrvq}"
+KEY_NAME="${2:-mywallet}"
+ADMIN_ADDRESS="${3:-addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn}"
 PLATFORM_FEE_PERCENT="${4:-100}"  # 1% in basis points
 PLATFORM_ADDRESS="${5:-$ADMIN_ADDRESS}"
 
@@ -67,13 +67,29 @@ fi
 
 # Check if key exists
 if ! safrochaind keys show "$KEY_NAME" &> /dev/null; then
-    echo -e "${YELLOW}Warning: Key '$KEY_NAME' not found. Attempting to use address directly.${NC}"
+    echo -e "${YELLOW}Warning: Key '$KEY_NAME' not found in keyring.${NC}"
+    echo -e "${YELLOW}Attempting to use address directly: $ADMIN_ADDRESS${NC}"
     USE_ADDRESS=true
     KEY_ADDRESS="$ADMIN_ADDRESS"
+    
+    # Verify the address format
+    if [[ ! "$KEY_ADDRESS" =~ ^addr_safro ]]; then
+        echo -e "${RED}Error: Invalid address format: $KEY_ADDRESS${NC}"
+        echo -e "${YELLOW}Safrochain addresses should start with 'addr_safro'${NC}"
+        exit 1
+    fi
 else
     USE_ADDRESS=false
     KEY_ADDRESS=$(safrochaind keys show "$KEY_NAME" -a)
     echo -e "Key Address: ${YELLOW}$KEY_ADDRESS${NC}"
+    
+    # Verify key can be used for transactions
+    echo -e "${YELLOW}Verifying key can be used for transactions...${NC}"
+    if ! safrochaind keys show "$KEY_NAME" &>/dev/null; then
+        echo -e "${RED}Error: Key '$KEY_NAME' exists but cannot be accessed${NC}"
+        echo -e "${YELLOW}Please check your keyring configuration${NC}"
+        exit 1
+    fi
 fi
 
 # Check account balance
@@ -156,22 +172,13 @@ cd "$CONTRACT_DIR"
 mkdir -p artifacts
 
 # Always optimize to ensure reference-types are removed
-# Prefer wasm-opt (faster, local) over Docker
-if command -v wasm-opt &> /dev/null; then
-    echo "Optimizing WASM file with wasm-opt (stripping reference-types)..."
-    # Use wasm-opt to strip reference-types and optimize
-    if wasm-opt -Os --strip-debug --strip-producers --disable-reference-types \
-        "$WASM_FILE" \
-        -o "$OPTIMIZED_WASM" 2>&1; then
-        echo -e "${GREEN}wasm-opt optimization successful${NC}"
-        OPTIMIZE_SUCCESS=true
-    else
-        echo -e "${RED}Error: wasm-opt optimization failed${NC}"
-        OPTIMIZE_SUCCESS=false
-    fi
-elif command -v docker &> /dev/null; then
+# IMPORTANT: Safrochain's wasmvm (v0.54.0) does NOT support bulk memory operations
+# We must use the CosmWasm optimizer (Docker) which properly handles this
+# The CosmWasm optimizer will optimize without enabling bulk memory
+if command -v docker &> /dev/null; then
     echo "Optimizing WASM file with Docker (cosmwasm/optimizer)..."
     echo -e "${YELLOW}Note: This may take a few minutes...${NC}"
+    echo -e "${YELLOW}Using CosmWasm optimizer to ensure compatibility with wasmvm v0.54.0${NC}"
     # Run optimizer with timeout (5 minutes)
     if timeout 300 docker run --rm -v "$CONTRACT_DIR":/code \
         --mount type=volume,source="$(basename "$CONTRACT_DIR")_cache",target=/code/target \
@@ -197,12 +204,49 @@ elif command -v docker &> /dev/null; then
         tail -20 /tmp/docker-optimize.log 2>/dev/null || echo "No output captured"
         OPTIMIZE_SUCCESS=false
     fi
+elif command -v wasm-opt &> /dev/null; then
+    echo -e "${YELLOW}Warning: Using wasm-opt instead of CosmWasm optimizer${NC}"
+    echo -e "${YELLOW}Note: Safrochain's wasmvm v0.54.0 does NOT support bulk memory${NC}"
+    echo -e "${YELLOW}Lowering memory.copy/memory.fill operations to regular memory ops...${NC}"
+    
+    # Create temporary file for intermediate step
+    TEMP_WASM="$CONTRACT_DIR/temp_optimized.wasm"
+    
+    # Step 1: Enable bulk memory temporarily to allow wasm-opt to process the file
+    # Then lower bulk memory operations to regular operations
+    # --enable-bulk-memory: needed to read the file (it contains bulk memory ops)
+    # --llvm-memory-copy-fill-lowering: converts memory.copy/memory.fill to regular ops and disables bulk-memory
+    echo "Step 1: Lowering bulk memory operations..."
+    if wasm-opt --enable-bulk-memory --llvm-memory-copy-fill-lowering \
+        "$WASM_FILE" \
+        -o "$TEMP_WASM" 2>&1; then
+        echo -e "${GREEN}Step 1 successful: Bulk memory operations lowered${NC}"
+        
+        # Step 2: Optimize and remove reference-types
+        echo "Step 2: Optimizing and removing reference-types..."
+        if wasm-opt -Os --strip-debug --strip-producers --disable-reference-types \
+            "$TEMP_WASM" \
+            -o "$OPTIMIZED_WASM" 2>&1; then
+            echo -e "${GREEN}wasm-opt optimization successful${NC}"
+            echo -e "${GREEN}Bulk memory operations lowered to regular memory operations${NC}"
+            rm -f "$TEMP_WASM"
+            OPTIMIZE_SUCCESS=true
+        else
+            echo -e "${RED}Error: Step 2 (optimization) failed${NC}"
+            rm -f "$TEMP_WASM"
+            OPTIMIZE_SUCCESS=false
+        fi
+    else
+        echo -e "${RED}Error: Step 1 (bulk memory lowering) failed${NC}"
+        rm -f "$TEMP_WASM"
+        OPTIMIZE_SUCCESS=false
+    fi
 else
-    echo -e "${RED}Error: No optimizer found (Docker or wasm-opt required)${NC}"
+    echo -e "${RED}Error: No optimizer found${NC}"
     echo -e "${RED}Reference-types must be removed for the contract to work on chain${NC}"
-    echo -e "\nPlease install one of:"
+    echo -e "${RED}For Safrochain (wasmvm v0.54.0), Docker with cosmwasm/optimizer is REQUIRED${NC}"
+    echo -e "\nPlease install Docker:"
     echo -e "  - Docker: https://docs.docker.com/get-docker/"
-    echo -e "  - wasm-opt: brew install binaryen (macOS) or apt-get install binaryen (Linux)"
     exit 1
 fi
 
@@ -220,30 +264,97 @@ echo -e "WASM file size: ${YELLOW}$WASM_SIZE${NC}"
 echo -e "\n${GREEN}[3/4] Uploading contract to chain...${NC}"
 echo -e "This may take a minute. Please wait...${NC}"
 
+# Test RPC connection first
+echo -e "${YELLOW}Testing RPC connection...${NC}"
+if ! safrochaind query bank balances "$KEY_ADDRESS" --node "$RPC_URL" --output json >/dev/null 2>&1; then
+    echo -e "${RED}Error: Cannot connect to RPC endpoint${NC}"
+    echo -e "${YELLOW}RPC URL: $RPC_URL${NC}"
+    echo -e "${YELLOW}Please check:${NC}"
+    echo -e "  1. RPC endpoint is accessible"
+    echo -e "  2. Network connection is working"
+    echo -e "  3. Chain ID is correct: $CHAIN_ID"
+    exit 1
+fi
+echo -e "${GREEN}RPC connection OK${NC}"
+
 # Use gas-prices instead of fixed fees (chain calculates fees automatically)
 GAS_PRICE="0.025${DENOM}"
 
 echo -e "Running: safrochaind tx wasm store $OPTIMIZED_WASM --from $KEY_NAME --chain-id $CHAIN_ID --node $RPC_URL --broadcast-mode sync --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
 echo ""
 
-# Capture both stdout and stderr
-UPLOAD_OUTPUT=$(safrochaind tx wasm store "$OPTIMIZED_WASM" \
-    --from "$KEY_NAME" \
-    --chain-id "$CHAIN_ID" \
-    --node "$RPC_URL" \
-    --broadcast-mode sync \
-    --gas auto \
-    --gas-adjustment 1.4 \
-    --gas-prices "$GAS_PRICE" \
-    -y \
-    --output json 2>&1)
-
-UPLOAD_EXIT_CODE=$?
+# Capture both stdout and stderr with timeout
+# Use timeout to prevent hanging (60 seconds should be enough)
+if command -v timeout &> /dev/null; then
+    UPLOAD_OUTPUT=$(timeout 60 safrochaind tx wasm store "$OPTIMIZED_WASM" \
+        --from "$KEY_NAME" \
+        --chain-id "$CHAIN_ID" \
+        --node "$RPC_URL" \
+        --broadcast-mode sync \
+        --gas auto \
+        --gas-adjustment 1.4 \
+        --gas-prices "$GAS_PRICE" \
+        -y \
+        --output json 2>&1)
+    UPLOAD_EXIT_CODE=$?
+    
+    # Check if timeout occurred
+    if [[ $UPLOAD_EXIT_CODE -eq 124 ]]; then
+        echo -e "${RED}Error: Command timed out after 60 seconds${NC}"
+        echo -e "${YELLOW}The transaction may still be processing. Check manually with:${NC}"
+        echo -e "  ${YELLOW}safrochaind query wasm list-code --node $RPC_URL --limit 5${NC}"
+        exit 1
+    fi
+else
+    # Fallback if timeout command is not available
+    UPLOAD_OUTPUT=$(safrochaind tx wasm store "$OPTIMIZED_WASM" \
+        --from "$KEY_NAME" \
+        --chain-id "$CHAIN_ID" \
+        --node "$RPC_URL" \
+        --broadcast-mode sync \
+        --gas auto \
+        --gas-adjustment 1.4 \
+        --gas-prices "$GAS_PRICE" \
+        -y \
+        --output json 2>&1)
+    UPLOAD_EXIT_CODE=$?
+fi
 
 # Always show the output for debugging
 echo "Transaction output:"
 echo "$UPLOAD_OUTPUT"
 echo ""
+
+# Check if output is empty (command might have failed silently)
+if [[ -z "$UPLOAD_OUTPUT" || "$UPLOAD_OUTPUT" == "" ]]; then
+    echo -e "${RED}Error: No output from transaction command${NC}"
+    echo -e "${YELLOW}This might indicate:${NC}"
+    echo -e "  - Network connection issue"
+    echo -e "  - RPC endpoint not responding"
+    echo -e "  - Key not found or incorrect"
+    echo -e "  - Command is hanging"
+    echo ""
+    echo -e "Trying to run command without output capture to debug..."
+    echo -e "${YELLOW}If this hangs, press Ctrl+C and check your connection${NC}"
+    echo ""
+    
+    # Try running without capture to see what happens
+    safrochaind tx wasm store "$OPTIMIZED_WASM" \
+        --from "$KEY_NAME" \
+        --chain-id "$CHAIN_ID" \
+        --node "$RPC_URL" \
+        --broadcast-mode sync \
+        --gas auto \
+        --gas-adjustment 1.4 \
+        --gas-prices "$GAS_PRICE" \
+        -y \
+        --output json
+    
+    echo ""
+    echo -e "${YELLOW}If you see output above, the command works but output capture failed.${NC}"
+    echo -e "${YELLOW}Please run the deployment manually or check the script.${NC}"
+    exit 1
+fi
 
 if [[ $UPLOAD_EXIT_CODE -ne 0 ]]; then
     echo -e "${RED}Error uploading contract (exit code: $UPLOAD_EXIT_CODE)${NC}"
@@ -252,14 +363,30 @@ if [[ $UPLOAD_EXIT_CODE -ne 0 ]]; then
     if echo "$UPLOAD_OUTPUT" | grep -qi "insufficient"; then
         echo -e "${YELLOW}Insufficient balance or fees error detected${NC}"
     fi
-    if echo "$UPLOAD_OUTPUT" | grep -qi "connection"; then
+    if echo "$UPLOAD_OUTPUT" | grep -qi "connection\|timeout\|refused"; then
         echo -e "${YELLOW}Connection error - check RPC endpoint${NC}"
+        echo -e "${YELLOW}RPC URL: $RPC_URL${NC}"
+    fi
+    if echo "$UPLOAD_OUTPUT" | grep -qi "key not found\|no such key"; then
+        echo -e "${YELLOW}Key '$KEY_NAME' not found in keyring${NC}"
+        echo -e "${YELLOW}Available keys:${NC}"
+        safrochaind keys list 2>/dev/null || echo "  (Could not list keys)"
+    fi
+    if echo "$UPLOAD_OUTPUT" | grep -qi "account.*not found"; then
+        echo -e "${YELLOW}Account not found. Please fund your account first.${NC}"
+        echo -e "${YELLOW}Account address: $KEY_ADDRESS${NC}"
     fi
     
     echo ""
     echo "Full error output:"
     echo "$UPLOAD_OUTPUT"
     exit 1
+fi
+
+# Check if output contains error messages even if exit code is 0
+if echo "$UPLOAD_OUTPUT" | grep -qi "error\|failed\|denied"; then
+    echo -e "${YELLOW}Warning: Output contains error messages${NC}"
+    echo "$UPLOAD_OUTPUT" | grep -i "error\|failed\|denied" || true
 fi
 
 # Extract JSON from output (may contain "gas estimate" line before JSON)
