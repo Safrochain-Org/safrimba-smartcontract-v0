@@ -1,0 +1,54 @@
+{
+    "rpc": "https://rpc.safrochain.com",
+    "rest": "https://rest.safrochain.com",
+    "chainId": "safrochain",
+    "chainName": "Safrochain",
+    "chainSymbolImageUrl": "https://raw.githubusercontent.com/chainapsis/keplr-chain-registry/main/images/safrochain/chain.png",
+    "walletUrlForStaking": "https://explorer.safrochain.com/safrochain/staking",
+    "nodeProvider": {
+        "name": "Safrochain",
+        "email": "dev@safrochain.com",
+        "website": "https://safrochain.com"
+    },
+    "stakeCurrency": {
+        "coinDenom": "SAF",
+        "coinMinimalDenom": "saf",
+        "coinDecimals": 6,
+        "coinImageUrl": "https://raw.githubusercontent.com/chainapsis/keplr-chain-registry/main/images/safrochain/saf.png"
+    },
+    "bip44": {
+        "coinType": 118
+    },
+    "bech32Config": {
+        "bech32PrefixAccAddr": "addr_safro",
+        "bech32PrefixAccPub": "addr_safropub",
+        "bech32PrefixValAddr": "addr_safrovaloper",
+        "bech32PrefixValPub": "addr_safrovaloperpub",
+        "bech32PrefixConsAddr": "addr_safrovalcons",
+        "bech32PrefixConsPub": "addr_safrovalconspub"
+    },
+    "currencies": [
+        {
+            "coinDenom": "SAF",
+            "coinMinimalDenom": "saf",
+            "coinDecimals": 6,
+            "coinImageUrl": "https://raw.githubusercontent.com/chainapsis/keplr-chain-registry/main/images/safrochain/saf.png"
+        }
+    ],
+    "feeCurrencies": [
+        {
+            "coinDenom": "SAF",
+            "coinMinimalDenom": "saf",
+            "coinDecimals": 6,
+            "gasPriceStep": {
+                "low": 0.01,
+                "average": 0.025,
+                "high": 0.04
+            },
+            "coinImageUrl": "https://raw.githubusercontent.com/chainapsis/keplr-chain-registry/main/images/safrochain/saf.png"
+        }
+    ],
+    "features": [],
+    "isTestnet": false
+}
+
