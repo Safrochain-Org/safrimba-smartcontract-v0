@@ -94,6 +94,7 @@ pub fn execute(
         ExecuteMsg::ProcessPayout { circle_id } => {
             execute_process_payout(deps, env, info, circle_id)
         }
+        ExecuteMsg::AdvanceRound { circle_id } => execute_advance_round(deps, env, info, circle_id),
         ExecuteMsg::Withdraw { circle_id } => execute_withdraw(deps, env, info, circle_id),
         ExecuteMsg::CheckAndEject { circle_id } => {
             execute_check_and_eject(deps, env, info, circle_id)
@@ -1733,6 +1734,123 @@ fn execute_process_payout(
         resp = resp.add_message(msg);
     }
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Advance Round — move to next round without payout (for Total/MinMembers threshold)
+// ---------------------------------------------------------------------------
+
+fn execute_advance_round(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if !matches!(circle.circle_status, CircleStatus::Running) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Running".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    // Authorization: manual_trigger_enabled means only creator can call (same as ProcessPayout)
+    if circle.manual_trigger_enabled && info.sender != circle.creator_address {
+        return Err(ContractError::Unauthorized {
+            msg: "Only creator can advance round (manual_trigger_enabled)".to_string(),
+        });
+    }
+
+    if let Some(next_payout) = circle.next_payout_date {
+        if env.block.time < next_payout {
+            return Err(ContractError::CycleNotReady {
+                next_date: next_payout.seconds(),
+            });
+        }
+    }
+
+    let round_in_cycle = ((circle.current_cycle_index - 1) % circle.max_members) + 1;
+    let min_round_for_distribution = match circle.distribution_threshold {
+        None => 1u32,
+        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::MinMembers { count }) => count,
+    };
+
+    if round_in_cycle >= min_round_for_distribution {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "AdvanceRound only when round_in_cycle < {} (current: {}). Use ProcessPayout for distribution round.",
+                min_round_for_distribution, round_in_cycle
+            ),
+        });
+    }
+
+    let active_members: Vec<Addr> = circle
+        .members_list
+        .iter()
+        .filter(|m| {
+            BLOCKED_MEMBERS
+                .may_load(deps.storage, (circle_id, (*m).clone()))
+                .unwrap_or(None)
+                .map(|bc| bc > circle.current_cycle_index)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let deposits_count = active_members
+        .iter()
+        .filter(|m| {
+            DEPOSITS
+                .may_load(deps.storage, (circle_id, (*m).clone(), circle.current_cycle_index))
+                .unwrap_or(None)
+                .is_some()
+        })
+        .count();
+
+    if deposits_count < active_members.len() {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "Not all active members have deposited: need {}, have {}",
+                active_members.len(),
+                deposits_count
+            ),
+        });
+    }
+
+    let total_rounds = circle.max_members * circle.total_cycles;
+    if circle.current_cycle_index >= total_rounds {
+        return Err(ContractError::InvalidParameters {
+            msg: "Circle has no more rounds to advance".to_string(),
+        });
+    }
+
+    circle.current_cycle_index += 1;
+    if let Some(current_date) = circle.next_payout_date {
+        circle.next_payout_date = Some(Timestamp::from_seconds(
+            current_date.seconds() + (circle.cycle_duration_days as u64 * 86400),
+        ));
+    }
+
+    circle.updated_at = env.block.time;
+    CIRCLES.save(deps.storage, circle_id, &circle)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "round_advanced",
+        &format!(
+            "Advanced to round {} (no payout — distribution at round {})",
+            circle.current_cycle_index, min_round_for_distribution
+        ),
+    )?;
+
+    Ok(Response::new()
+        .add_attribute("action", "advance_round")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("new_cycle_index", circle.current_cycle_index.to_string()))
 }
 
 // ---------------------------------------------------------------------------

@@ -79,6 +79,10 @@ pub enum ExecuteMsg {
     ProcessPayout {
         circle_id: u64,
     },
+    /// Advance to next round without payout. Callable when all deposited and round_in_cycle < min_round_for_distribution (e.g. Total threshold at round 1).
+    AdvanceRound {
+        circle_id: u64,
+    },
     /// Withdraw all pending (accumulated) payouts owed to caller. Callable anytime by any member who has pending payouts.
     Withdraw {
         circle_id: u64,
