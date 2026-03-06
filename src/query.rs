@@ -3,8 +3,8 @@ use cw_storage_plus::Bound;
 
 use crate::msg::{
     AccumulatedLateFeesResponse, BalanceResponse, CircleResponse, CirclesResponse, CycleResponse,
-    DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse,
-    PenaltiesResponse, PendingPayoutResponse, PendingRefundsResponse, RefundsResponse,
+    DepositRequirementResponse, DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse,
+    PayoutsResponse, PenaltiesResponse, PendingPayoutResponse, PendingRefundsResponse, RefundsResponse,
     StatusResponse, CircleStatsResponse, CircleStakingInfoResponse, MemberLockedAmountResponse,
     BlockedMembersResponse, MemberPseudonymResponse, PrivateMembersResponse,
     DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
@@ -12,8 +12,8 @@ use crate::msg::{
 use crate::state::{
     Circle, CircleStatus, CIRCLES, CIRCLE_STAKING, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS,
     PENALTIES, PENDING_REFUNDS, REFUNDS, MEMBER_LOCKED_AMOUNTS, MEMBER_ACCUMULATED_LATE_FEES,
-    MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST, PENDING_PAYOUTS,
-    DistributionThreshold,
+    MEMBER_LAST_DEPOSITED_CYCLE, MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS,
+    PRIVATE_MEMBER_LIST, PENDING_PAYOUTS, DistributionThreshold,
 };
 
 pub fn query_circle(deps: Deps, _env: Env, circle_id: u64) -> StdResult<CircleResponse> {
@@ -417,6 +417,62 @@ pub fn query_member_accumulated_late_fees(
         exit_penalty,
         locked_amount,
         rounds_until_ejection,
+    })
+}
+
+pub fn query_deposit_requirement(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<DepositRequirementResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    let blocked = BLOCKED_MEMBERS
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .map(|bc| bc <= circle.current_cycle_index)
+        .unwrap_or(false);
+
+    let already_deposited = DEPOSITS
+        .may_load(deps.storage, (circle_id, member.clone(), circle.current_cycle_index))?
+        .is_some();
+
+    let last_deposited_cycle = MEMBER_LAST_DEPOSITED_CYCLE
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .or_else(|| {
+            DEPOSITS
+                .prefix((circle_id, member.clone()))
+                .range(deps.storage, None, None, Order::Descending)
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(c, _)| c)
+        })
+        .unwrap_or(0);
+
+    let rounds_missed = circle
+        .current_cycle_index
+        .saturating_sub(last_deposited_cycle)
+        .saturating_sub(1);
+
+    let late_fee_per_round = circle
+        .contribution_amount
+        .multiply_ratio(circle.late_fee_percent, 10000u64);
+    let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+    let required_amount = circle
+        .contribution_amount
+        .checked_add(late_fee_total)
+        .unwrap_or(circle.contribution_amount);
+
+    let can_deposit = !blocked
+        && !already_deposited
+        && rounds_missed < circle.max_missed_payments_allowed;
+
+    Ok(DepositRequirementResponse {
+        required_amount,
+        missed_rounds: rounds_missed,
+        can_deposit,
+        contribution_amount: circle.contribution_amount,
+        late_fee_total,
     })
 }
 

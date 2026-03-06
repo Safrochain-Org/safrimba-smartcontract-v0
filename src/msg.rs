@@ -178,6 +178,7 @@ pub enum QueryMsg {
     // Pending payouts and late fees
     GetPendingPayout { circle_id: u64, member: Addr },
     GetMemberAccumulatedLateFees { circle_id: u64, member: Addr },
+    GetDepositRequirement { circle_id: u64, member: Addr },
 
     // Event Queries
     GetEvents { circle_id: u64, limit: Option<u32> },
@@ -341,6 +342,15 @@ pub struct AccumulatedLateFeesResponse {
     pub locked_amount: Uint128,
     /// Rounds remaining before ejection
     pub rounds_until_ejection: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct DepositRequirementResponse {
+    pub required_amount: Uint128,
+    pub missed_rounds: u32,
+    pub can_deposit: bool,
+    pub contribution_amount: Uint128,
+    pub late_fee_total: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

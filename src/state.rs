@@ -232,6 +232,8 @@ pub const MEMBER_LOCKED_AMOUNTS: Map<(u64, Addr), Uint128> = Map::new("member_lo
 pub const MEMBER_ACCUMULATED_LATE_FEES: Map<(u64, Addr), Uint128> = Map::new("member_accum_late_fees");
 /// Pending payout amounts waiting for member to call Withdraw
 pub const PENDING_PAYOUTS: Map<(u64, Addr), Uint128> = Map::new("pending_payouts");
+/// Last cycle index for which member deposited (used for late-fee calculation on catch-up deposit)
+pub const MEMBER_LAST_DEPOSITED_CYCLE: Map<(u64, Addr), u32> = Map::new("member_last_deposited_cycle");
 pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members");
 pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms");
 pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list");

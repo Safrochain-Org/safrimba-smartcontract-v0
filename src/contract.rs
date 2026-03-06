@@ -5,11 +5,11 @@ use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::query::{
     query_circle, query_circle_balance, query_circle_members, query_circle_stats,
-    query_circle_status, query_current_cycle, query_cycle_deposits, query_events,
-    query_member_balance, query_member_deposits, query_member_stats, query_payout_history,
-    query_payouts, query_penalties, query_refunds, query_circles, query_member_locked_amount,
-    query_blocked_members, query_member_pseudonym, query_private_members,
-    query_distribution_calendar, query_archived_date, query_pending_payout,
+    query_circle_status, query_current_cycle, query_cycle_deposits, query_deposit_requirement,
+    query_events, query_member_balance, query_member_deposits, query_member_stats,
+    query_payout_history, query_payouts, query_penalties, query_refunds, query_circles,
+    query_member_locked_amount, query_blocked_members, query_member_pseudonym,
+    query_private_members, query_distribution_calendar, query_archived_date, query_pending_payout,
     query_member_accumulated_late_fees, query_circle_staking_info, query_pending_refunds,
 };
 use crate::state::PlatformConfig;
@@ -131,6 +131,11 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
         QueryMsg::GetMemberAccumulatedLateFees { circle_id, member } => {
             cosmwasm_std::to_json_binary(&query_member_accumulated_late_fees(
+                deps, env, circle_id, member,
+            )?)
+        }
+        QueryMsg::GetDepositRequirement { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_deposit_requirement(
                 deps, env, circle_id, member,
             )?)
         }

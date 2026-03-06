@@ -10,9 +10,9 @@ use crate::state::{
     Circle, CircleStakingConfig, CircleStatus, DepositRecord, DistributionThreshold, EventLog,
     MemberMissedPayments, PayoutOrderType, PayoutRecord, PendingRefundRecord, PendingUndelegation,
     PenaltyRecord, RefundMode, Visibility, BLOCKED_MEMBERS, CIRCLE_COUNTER, CIRCLES, CIRCLE_STAKING,
-    DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LOCKED_AMOUNTS,
-    MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES, PENDING_PAYOUTS, PENDING_REFUNDS,
-    PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
+    DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LAST_DEPOSITED_CYCLE,
+    MEMBER_LOCKED_AMOUNTS, MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES,
+    PENDING_PAYOUTS, PENDING_REFUNDS, PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
 };
 
 pub fn execute(
@@ -1170,100 +1170,108 @@ fn execute_deposit_contribution(
         });
     }
 
-    // Require exactly contribution_amount — no extra for fees (fees tracked against locked amount)
+    // Last cycle member deposited for (from MEMBER_LAST_DEPOSITED_CYCLE or scan DEPOSITS for backward compat)
+    let last_deposited_cycle = MEMBER_LAST_DEPOSITED_CYCLE
+        .may_load(deps.storage, (circle_id, info.sender.clone()))?
+        .or_else(|| {
+            DEPOSITS
+                .prefix((circle_id, info.sender.clone()))
+                .range(deps.storage, None, None, Order::Descending)
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(c, _)| c)
+        })
+        .unwrap_or(0);
+
+    // Rounds missed = cycles between last_deposited+1 and current-1 (inclusive)
+    let rounds_missed = circle
+        .current_cycle_index
+        .saturating_sub(last_deposited_cycle)
+        .saturating_sub(1);
+
+    let late_fee_per_round =
+        compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+
+    // If missed >= max_missed: add late fees for missed rounds, then eject, cannot deposit
+    if rounds_missed >= circle.max_missed_payments_allowed {
+        let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+        let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
+            .may_load(deps.storage, (circle_id, info.sender.clone()))?
+            .unwrap_or(Uint128::zero());
+        accumulated = accumulated
+            .checked_add(late_fee_total)
+            .unwrap_or(accumulated);
+        MEMBER_ACCUMULATED_LATE_FEES.save(
+            deps.storage,
+            (circle_id, info.sender.clone()),
+            &accumulated,
+        )?;
+
+        let locked = MEMBER_LOCKED_AMOUNTS
+            .may_load(deps.storage, (circle_id, info.sender.clone()))?
+            .unwrap_or(Uint128::zero());
+        if should_eject_member(
+            deps.storage,
+            circle_id,
+            &info.sender,
+            locked,
+            circle.exit_penalty_percent,
+        ) {
+            eject_member_from_circle(&mut deps, &env, &mut circle, &info.sender)?;
+            CIRCLES.save(deps.storage, circle_id, &circle)?;
+        }
+        return Err(ContractError::MaxMissedPaymentsExceeded {
+            max: circle.max_missed_payments_allowed,
+        });
+    }
+
+    let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+    let required_amount = circle
+        .contribution_amount
+        .checked_add(late_fee_total)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Required amount overflow".to_string(),
+        })?;
+
     let payment = must_pay(&info, &circle.denomination).map_err(|_| {
         ContractError::InsufficientFunds {
-            required: circle.contribution_amount.to_string(),
+            required: required_amount.to_string(),
             sent: "0".to_string(),
         }
     })?;
 
-    if payment < circle.contribution_amount {
+    if payment < required_amount {
         return Err(ContractError::InsufficientFunds {
-            required: circle.contribution_amount.to_string(),
+            required: required_amount.to_string(),
             sent: payment.to_string(),
         });
     }
 
-    // Determine if late
-    let mut is_late = false;
-    if let Some(next_payout) = circle.next_payout_date {
-        let grace_end = next_payout.plus_seconds(circle.grace_period_hours as u64 * 3600);
-        if env.block.time > grace_end {
-            is_late = true;
+    let is_late = rounds_missed > 0;
 
-            // Strict mode: in strict mode, ejection is automatic but deposit is still accepted
-            // (we record the late fee against locked amount and let CheckAndEject handle ejection)
-            let late_fee_per_round =
-                compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+    // Add late fees (paid in tokens) to pool
+    if !late_fee_total.is_zero() {
+        circle.total_penalties_collected = circle
+            .total_penalties_collected
+            .checked_add(late_fee_total)
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Penalties overflow".to_string(),
+            })?;
 
-            let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(Uint128::zero());
-            accumulated = accumulated
-                .checked_add(late_fee_per_round)
-                .unwrap_or(accumulated);
-            MEMBER_ACCUMULATED_LATE_FEES.save(
-                deps.storage,
-                (circle_id, info.sender.clone()),
-                &accumulated,
-            )?;
-
-            // Track missed payment count
-            let mut missed = MEMBER_MISSED_PAYMENTS
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(MemberMissedPayments {
-                    member: info.sender.clone(),
-                    missed_count: 0,
-                    last_missed_cycle: None,
-                });
-            missed.missed_count += 1;
-            missed.last_missed_cycle = Some(circle.current_cycle_index);
-            MEMBER_MISSED_PAYMENTS.save(
-                deps.storage,
-                (circle_id, info.sender.clone()),
-                &missed,
-            )?;
-
-            // Record late fee as penalty record for history
-            PENALTIES.save(
-                deps.storage,
-                (circle_id, info.sender.clone(), circle.current_cycle_index),
-                &PenaltyRecord {
-                    member: info.sender.clone(),
-                    cycle: circle.current_cycle_index,
-                    amount: late_fee_per_round,
-                    reason: format!(
-                        "Late payment ({}% of contribution deducted from locked amount)",
-                        circle.late_fee_percent / 100
-                    ),
-                    timestamp: env.block.time,
-                },
-            )?;
-
-            // Check ejection condition AFTER accumulating late fee
-            let locked = MEMBER_LOCKED_AMOUNTS
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(Uint128::zero());
-
-            if should_eject_member(
-                deps.storage,
-                circle_id,
-                &info.sender,
-                locked,
-                circle.exit_penalty_percent,
-            ) {
-                eject_member_from_circle(&mut deps, &env, &mut circle, &info.sender)?;
-                CIRCLES.save(deps.storage, circle_id, &circle)?;
-                // Deposit is rejected since member is now ejected
-                return Err(ContractError::MaxMissedPaymentsExceeded {
-                    max: circle.max_missed_payments_allowed,
-                });
-            }
-        } else if env.block.time > next_payout {
-            // Within grace period: still on-time from penalty perspective but flagged as late
-            is_late = true;
-        }
+        PENALTIES.save(
+            deps.storage,
+            (circle_id, info.sender.clone(), circle.current_cycle_index),
+            &PenaltyRecord {
+                member: info.sender.clone(),
+                cycle: circle.current_cycle_index,
+                amount: late_fee_total,
+                reason: format!(
+                    "Late deposit: {} rounds missed ({}% per round paid in tokens)",
+                    rounds_missed, circle.late_fee_percent / 100
+                ),
+                timestamp: env.block.time,
+            },
+        )?;
     }
 
     // Record deposit
@@ -1279,6 +1287,12 @@ fn execute_deposit_contribution(
         },
     )?;
 
+    MEMBER_LAST_DEPOSITED_CYCLE.save(
+        deps.storage,
+        (circle_id, info.sender.clone()),
+        &circle.current_cycle_index,
+    )?;
+
     circle.total_amount_locked = circle
         .total_amount_locked
         .checked_add(circle.contribution_amount)
@@ -1292,6 +1306,10 @@ fn execute_deposit_contribution(
         circle.members_paid_this_cycle.push(info.sender.clone());
     }
 
+    let deposited_cycle = circle.current_cycle_index;
+
+    // Rounds advance by calendar (AdvanceRound/ProcessPayout), not by deposit
+
     circle.updated_at = env.block.time;
     CIRCLES.save(deps.storage, circle_id, &circle)?;
 
@@ -1302,7 +1320,7 @@ fn execute_deposit_contribution(
         "contribution_deposited",
         &format!(
             "Member {} deposited {} for cycle {} (on_time: {})",
-            info.sender, circle.contribution_amount, circle.current_cycle_index, !is_late
+            info.sender, circle.contribution_amount, deposited_cycle, !is_late
         ),
     )?;
 
@@ -1311,7 +1329,7 @@ fn execute_deposit_contribution(
         .add_attribute("action", "deposit_contribution")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("member", info.sender)
-        .add_attribute("cycle", circle.current_cycle_index.to_string())
+        .add_attribute("cycle", deposited_cycle.to_string())
         .add_attribute("amount", circle.contribution_amount.to_string())
         .add_attribute("on_time", (!is_late).to_string());
     for msg in staking_msgs {
@@ -1515,12 +1533,13 @@ fn execute_process_payout(
         })
         .count();
 
-    // Distribution threshold check
-    let round_in_cycle = ((circle.current_cycle_index - 1) % circle.max_members) + 1;
+    // Distribution threshold check (based on active members)
+    let active_count = active_members.len() as u32;
+    let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
     let min_round_for_distribution = match circle.distribution_threshold {
         None => 1u32,
-        Some(DistributionThreshold::Total) => circle.max_members,
-        Some(DistributionThreshold::MinMembers { count }) => count,
+        Some(DistributionThreshold::Total) => active_count,
+        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
     };
 
     if round_in_cycle < min_round_for_distribution {
@@ -1532,20 +1551,36 @@ fn execute_process_payout(
         });
     }
 
-    if deposits_count < active_members.len() {
+    // All active must have contributed (deposit or locked used for missing)
+    let effective_contributors = deposits_count
+        + missing_members
+            .iter()
+            .filter(|m| active_members.contains(m))
+            .count();
+    if effective_contributors < active_members.len() {
         return Err(ContractError::InvalidParameters {
             msg: format!(
-                "Not all active members have deposited: need {}, have {}",
+                "Not all active members have contributed: need {}, have {}",
                 active_members.len(),
-                deposits_count
+                effective_contributors
             ),
         });
     }
 
-    // Get recipient
+    // Get recipient (filter payout order to active members only)
     let recipient = if let Some(ref order_list) = circle.payout_order_list {
-        let index = (circle.current_cycle_index as usize - 1) % order_list.len();
-        order_list[index].clone()
+        let active_order: Vec<Addr> = order_list
+            .iter()
+            .filter(|m| active_members.iter().any(|a| a == *m))
+            .cloned()
+            .collect();
+        if active_order.is_empty() {
+            return Err(ContractError::InvalidParameters {
+                msg: "No active members in payout order".to_string(),
+            });
+        }
+        let index = (round_in_cycle as usize - 1) % active_order.len();
+        active_order[index].clone()
     } else {
         return Err(ContractError::InvalidParameters {
             msg: "Payout order not set".to_string(),
@@ -1770,22 +1805,7 @@ fn execute_advance_round(
         }
     }
 
-    let round_in_cycle = ((circle.current_cycle_index - 1) % circle.max_members) + 1;
-    let min_round_for_distribution = match circle.distribution_threshold {
-        None => 1u32,
-        Some(DistributionThreshold::Total) => circle.max_members,
-        Some(DistributionThreshold::MinMembers { count }) => count,
-    };
-
-    if round_in_cycle >= min_round_for_distribution {
-        return Err(ContractError::InvalidParameters {
-            msg: format!(
-                "AdvanceRound only when round_in_cycle < {} (current: {}). Use ProcessPayout for distribution round.",
-                min_round_for_distribution, round_in_cycle
-            ),
-        });
-    }
-
+    // Active members (not blocked) — used for round_in_cycle and min_round
     let active_members: Vec<Addr> = circle
         .members_list
         .iter()
@@ -1799,24 +1819,121 @@ fn execute_advance_round(
         .cloned()
         .collect();
 
-    let deposits_count = active_members
+    if active_members.is_empty() {
+        return Err(ContractError::InvalidParameters {
+            msg: "No active members".to_string(),
+        });
+    }
+
+    let active_count = active_members.len() as u32;
+    let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
+    let min_round_for_distribution = match circle.distribution_threshold {
+        None => 1u32,
+        Some(DistributionThreshold::Total) => active_count,
+        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
+    };
+
+    if round_in_cycle >= min_round_for_distribution {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "AdvanceRound only when round_in_cycle < {} (current: {}). Use ProcessPayout for distribution round.",
+                min_round_for_distribution, round_in_cycle
+            ),
+        });
+    }
+
+    // Process missing members: add late fees, check ejection, use locked funds (calendar-based advance)
+    let missing_members: Vec<Addr> = active_members
         .iter()
         .filter(|m| {
             DEPOSITS
                 .may_load(deps.storage, (circle_id, (*m).clone(), circle.current_cycle_index))
                 .unwrap_or(None)
-                .is_some()
+                .is_none()
         })
-        .count();
+        .cloned()
+        .collect();
 
-    if deposits_count < active_members.len() {
-        return Err(ContractError::InvalidParameters {
-            msg: format!(
-                "Not all active members have deposited: need {}, have {}",
-                active_members.len(),
-                deposits_count
-            ),
-        });
+    for member in &missing_members {
+        let late_fee_per_round =
+            compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+
+        let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
+            .may_load(deps.storage, (circle_id, member.clone()))?
+            .unwrap_or(Uint128::zero());
+
+        let mut missed = MEMBER_MISSED_PAYMENTS
+            .may_load(deps.storage, (circle_id, member.clone()))?
+            .unwrap_or(MemberMissedPayments {
+                member: member.clone(),
+                missed_count: 0,
+                last_missed_cycle: None,
+            });
+
+        if missed.last_missed_cycle != Some(circle.current_cycle_index) {
+            missed.missed_count += 1;
+            missed.last_missed_cycle = Some(circle.current_cycle_index);
+            accumulated = accumulated
+                .checked_add(late_fee_per_round)
+                .unwrap_or(accumulated);
+
+            MEMBER_ACCUMULATED_LATE_FEES.save(
+                deps.storage,
+                (circle_id, member.clone()),
+                &accumulated,
+            )?;
+            MEMBER_MISSED_PAYMENTS.save(
+                deps.storage,
+                (circle_id, member.clone()),
+                &missed,
+            )?;
+        }
+
+        let locked = MEMBER_LOCKED_AMOUNTS
+            .may_load(deps.storage, (circle_id, member.clone()))?
+            .unwrap_or(Uint128::zero());
+
+        if should_eject_member(
+            deps.storage,
+            circle_id,
+            member,
+            locked,
+            circle.exit_penalty_percent,
+        ) {
+            eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
+        }
+
+        let _used = use_locked_amount_for_member(
+            deps.storage,
+            circle_id,
+            member,
+            circle.contribution_amount,
+        )?;
+    }
+
+    // Also use locked from previously blocked members for this round
+    let blocked_members_list: Vec<Addr> = BLOCKED_MEMBERS
+        .prefix(circle_id)
+        .range(deps.storage, None, None, Order::Ascending)
+        .filter_map(|res| res.ok().map(|(m, _)| m))
+        .collect();
+
+    for blocked_member in blocked_members_list {
+        if missing_members.iter().any(|m| m == &blocked_member) {
+            continue;
+        }
+        if let Ok(Some(bc)) =
+            BLOCKED_MEMBERS.may_load(deps.storage, (circle_id, blocked_member.clone()))
+        {
+            if bc <= circle.current_cycle_index {
+                let _used = use_locked_amount_for_member(
+                    deps.storage,
+                    circle_id,
+                    &blocked_member,
+                    circle.contribution_amount,
+                )?;
+            }
+        }
     }
 
     let total_rounds = circle.max_members * circle.total_cycles;
