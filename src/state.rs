@@ -20,16 +20,22 @@ pub struct Circle {
     pub invite_only: bool,
     pub members_list: Vec<Addr>,
     pub pending_members: Vec<Addr>,
-    pub member_exit_allowed_before_start: bool,
 
-    // Financial Parameters (using SAF)
+    // Financial Parameters (using SAF, fees in basis points)
     pub contribution_amount: Uint128,
-    pub denomination: String, // Always "saf" for SAF token
-    pub payout_amount: Uint128, // contribution_amount * total_members
-    pub penalty_fee_amount: Uint128,
-    pub late_fee_amount: Uint128,
+    pub denomination: String, // Always "usaf"
+    pub payout_amount: Uint128, // contribution_amount * max_members
+    /// Exit penalty in basis points (e.g. 2000 = 20% of locked amount). Applied on ejection or voluntary exit before all cycles end.
+    pub exit_penalty_percent: u64,
+    /// Late fee per missed round, in basis points of contribution_amount (e.g. 1000 = 10%). Accumulated against locked amount.
+    pub late_fee_percent: u64,
     pub platform_fee_percent: u64, // Basis points (10000 = 100%)
-    pub arbiter_fee_percent: Option<u64>,
+    /// Dynamically calculated from % penalty and late fee. Set at start, updated on exit/ejection.
+    /// Formula: floor((10000 - exit_penalty_percent) / late_fee_percent) * active_members / members_at_start
+    pub max_missed_payments_allowed: u32,
+    /// Number of active members when circle started. Set at StartCircle, used to scale max_missed on exit/ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members_at_start: Option<u32>,
 
     // Cycle & Time Parameters
     pub total_cycles: u32,
@@ -43,7 +49,7 @@ pub struct Circle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_start_type: Option<String>, // "by_members" or "by_date"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_start_date: Option<Timestamp>, // Date for auto-start if type is "by_date"
+    pub auto_start_date: Option<Timestamp>,
 
     // Payout Logic Parameters
     pub payout_order_type: PayoutOrderType,
@@ -52,11 +58,9 @@ pub struct Circle {
     pub manual_trigger_enabled: bool,
 
     // Security & Risk Controls
-    pub arbiter_address: Option<Addr>,
     pub emergency_stop_enabled: bool,
     pub emergency_stop_triggered: bool,
     pub auto_refund_if_min_not_met: bool,
-    pub max_missed_payments_allowed: u32,
     pub strict_mode: bool,
 
     // Escrow and Funds Management
@@ -64,13 +68,14 @@ pub struct Circle {
     pub total_amount_locked: Uint128,
     pub total_penalties_collected: Uint128,
     pub total_platform_fees_collected: Uint128,
+    pub total_pending_payouts: Uint128,
     pub withdrawal_lock: bool,
     pub refund_mode: RefundMode,
-    
+
     // Locking and Security Features
-    pub creator_lock_amount: Uint128, // Locked by creator (10 SAF minimum)
+    pub creator_lock_amount: Uint128, // = contribution_amount * (1 + max_members * 0.1)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_distribution_threshold_percent: Option<u64>, // % required before first distribution (max 60)
+    pub distribution_threshold: Option<DistributionThreshold>,
 
     // Internal State Parameters
     pub circle_status: CircleStatus,
@@ -106,6 +111,17 @@ pub enum RefundMode {
     FullRefund,
     PartialRefund,
     AutoDistribute,
+}
+
+/// When the first distribution happens each cycle (round-based, not deposit count).
+/// Applied to every cycle: determines which rounds have a payout.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributionThreshold {
+    /// 100% of all members: one distribution only at the last round of each cycle.
+    Total,
+    /// Wait `count` rounds, then one distribution per round through end of cycle.
+    MinMembers { count: u32 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -171,6 +187,32 @@ pub struct PlatformConfig {
     pub platform_address: Addr,
 }
 
+// Staking configuration per circle
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct CircleStakingConfig {
+    pub enabled: bool,
+    pub validator_address: String,
+    pub staked_amount: Uint128,
+    pub total_rewards_earned: Uint128,
+    pub rewards_accumulated: Uint128,
+    pub last_claim_at: Option<Timestamp>,
+    pub pending_undelegations: Vec<PendingUndelegation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PendingUndelegation {
+    pub amount: Uint128,
+    pub available_at: Timestamp,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PendingRefundRecord {
+    pub member: Addr,
+    pub amount: Uint128,
+    pub available_at: Timestamp,
+}
+
 // Storage
 pub const PLATFORM_CONFIG: Item<PlatformConfig> = Item::new("platform_config");
 pub const CIRCLE_COUNTER: Item<u64> = Item::new("circle_counter");
@@ -184,8 +226,16 @@ pub const MEMBER_MISSED_PAYMENTS: Map<(u64, Addr), MemberMissedPayments> = Map::
 pub const EVENT_COUNTER: Map<u64, u64> = Map::new("event_counter");
 
 // Locking and Private Circle Storage
-pub const MEMBER_LOCKED_AMOUNTS: Map<(u64, Addr), Uint128> = Map::new("member_locked_amounts"); // Join deposits per member per circle
-pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members"); // Track which cycle member was blocked
-pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms"); // Pseudonyms for private circles
-pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list"); // Explicitly added members for private circles
+/// Join deposits locked per member (one contribution_amount per member; creator uses circle.creator_lock_amount)
+pub const MEMBER_LOCKED_AMOUNTS: Map<(u64, Addr), Uint128> = Map::new("member_locked_amounts");
+/// Cumulative late fees accumulated against each member's locked amount (tracked in-contract, no extra funds required from member at deposit time)
+pub const MEMBER_ACCUMULATED_LATE_FEES: Map<(u64, Addr), Uint128> = Map::new("member_accum_late_fees");
+/// Pending payout amounts waiting for member to call Withdraw
+pub const PENDING_PAYOUTS: Map<(u64, Addr), Uint128> = Map::new("pending_payouts");
+pub const BLOCKED_MEMBERS: Map<(u64, Addr), u32> = Map::new("blocked_members");
+pub const MEMBER_PSEUDONYMS: Map<(u64, Addr), String> = Map::new("member_pseudonyms");
+pub const PRIVATE_MEMBER_LIST: Map<u64, Vec<Addr>> = Map::new("private_member_list");
 
+// Staking: per-circle staking config; refunds queued when liquid balance insufficient
+pub const CIRCLE_STAKING: Map<u64, CircleStakingConfig> = Map::new("circle_staking");
+pub const PENDING_REFUNDS: Map<(u64, Addr), PendingRefundRecord> = Map::new("pending_refunds");

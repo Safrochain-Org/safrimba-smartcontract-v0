@@ -175,36 +175,10 @@ mkdir -p artifacts
 # IMPORTANT: Safrochain's wasmvm (v0.54.0) does NOT support bulk memory operations
 # We must use the CosmWasm optimizer (Docker) which properly handles this
 # The CosmWasm optimizer will optimize without enabling bulk memory
-if command -v docker &> /dev/null; then
-    echo "Optimizing WASM file with Docker (cosmwasm/optimizer)..."
-    echo -e "${YELLOW}Note: This may take a few minutes...${NC}"
-    echo -e "${YELLOW}Using CosmWasm optimizer to ensure compatibility with wasmvm v0.54.0${NC}"
-    # Run optimizer with timeout (5 minutes)
-    if timeout 300 docker run --rm -v "$CONTRACT_DIR":/code \
-        --mount type=volume,source="$(basename "$CONTRACT_DIR")_cache",target=/code/target \
-        --mount type=volume,source=registry_cache,target=/usr/local/cargo/registry \
-        cosmwasm/optimizer:0.14.0 > /tmp/docker-optimize.log 2>&1; then
-        if [[ -f "$OPTIMIZED_WASM" ]]; then
-            echo -e "${GREEN}Docker optimization successful${NC}"
-            OPTIMIZE_SUCCESS=true
-        else
-            echo -e "${YELLOW}Docker optimization completed but output file not found${NC}"
-            echo "Last 20 lines of Docker output:"
-            tail -20 /tmp/docker-optimize.log
-            OPTIMIZE_SUCCESS=false
-        fi
-    else
-        EXIT_CODE=$?
-        if [[ $EXIT_CODE -eq 124 ]]; then
-            echo -e "${RED}Error: Docker optimization timed out after 5 minutes${NC}"
-        else
-            echo -e "${RED}Error: Docker optimization failed${NC}"
-        fi
-        echo "Last 20 lines of Docker output:"
-        tail -20 /tmp/docker-optimize.log 2>/dev/null || echo "No output captured"
-        OPTIMIZE_SUCCESS=false
-    fi
-elif command -v wasm-opt &> /dev/null; then
+# Use wasm-opt directly (preferred: faster, no Docker, handles modern Rust editions)
+# Install on macOS: brew install binaryen
+# Install on Ubuntu: apt-get install binaryen
+if command -v wasm-opt &> /dev/null; then
     echo -e "${YELLOW}Warning: Using wasm-opt instead of CosmWasm optimizer${NC}"
     echo -e "${YELLOW}Note: Safrochain's wasmvm v0.54.0 does NOT support bulk memory${NC}"
     echo -e "${YELLOW}Lowering memory.copy/memory.fill operations to regular memory ops...${NC}"
@@ -285,8 +259,15 @@ echo ""
 
 # Capture both stdout and stderr with timeout
 # Use timeout to prevent hanging (60 seconds should be enough)
-if command -v timeout &> /dev/null; then
-    UPLOAD_OUTPUT=$(timeout 60 safrochaind tx wasm store "$OPTIMIZED_WASM" \
+# Portable timeout: gtimeout (macOS), timeout (Linux), or no-timeout fallback
+UPLOAD_TIMEOUT=""
+if command -v gtimeout &> /dev/null; then
+    UPLOAD_TIMEOUT="gtimeout 60"
+elif command -v timeout &> /dev/null; then
+    UPLOAD_TIMEOUT="timeout 60"
+fi
+if [[ -n "$UPLOAD_TIMEOUT" ]]; then
+    UPLOAD_OUTPUT=$($UPLOAD_TIMEOUT safrochaind tx wasm store "$OPTIMIZED_WASM" \
         --from "$KEY_NAME" \
         --chain-id "$CHAIN_ID" \
         --node "$RPC_URL" \

@@ -2,7 +2,7 @@ use cosmwasm_std::{Addr, Uint128, Timestamp};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{CircleStatus, PayoutOrderType, Visibility};
+use crate::state::{CircleStatus, DistributionThreshold, PayoutOrderType, Visibility};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct InstantiateMsg {
@@ -23,8 +23,10 @@ pub enum ExecuteMsg {
         min_members_required: u32,
         invite_only: bool,
         contribution_amount: Uint128,
-        penalty_fee_amount: Uint128,
-        late_fee_amount: Uint128,
+        /// Exit penalty in basis points of locked amount (e.g. 2000 = 20%)
+        exit_penalty_percent: u64,
+        /// Late fee per missed round, in basis points of contribution_amount (e.g. 1000 = 10%)
+        late_fee_percent: u64,
         total_cycles: u32,
         cycle_duration_days: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,52 +34,57 @@ pub enum ExecuteMsg {
         grace_period_hours: u32,
         auto_start_when_full: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        auto_start_type: Option<String>, // "by_members" or "by_date"
+        auto_start_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        auto_start_date: Option<Timestamp>, // Date for auto-start if type is "by_date"
+        auto_start_date: Option<Timestamp>,
         payout_order_type: PayoutOrderType,
         #[serde(skip_serializing_if = "Option::is_none")]
         payout_order_list: Option<Vec<Addr>>,
         auto_payout_enabled: bool,
         manual_trigger_enabled: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        arbiter_address: Option<Addr>,
         emergency_stop_enabled: bool,
         auto_refund_if_min_not_met: bool,
-        max_missed_payments_allowed: u32,
         strict_mode: bool,
-        member_exit_allowed_before_start: bool,
         visibility: Visibility,
         show_member_identities: bool,
+        /// When the first distribution happens each cycle (round-based). None = round 1; Total = 100% of all members (last round only); MinMembers(count) = wait count rounds.
+        /// For Public circles this is forced to Total regardless of input.
         #[serde(skip_serializing_if = "Option::is_none")]
-        arbiter_fee_percent: Option<u64>,
-        creator_lock_amount: Uint128, // Minimum 10 SAF
-        #[serde(skip_serializing_if = "Option::is_none")]
-        first_distribution_threshold_percent: Option<u64>, // Max 60%
+        distribution_threshold: Option<DistributionThreshold>,
     },
+    /// Join a circle — must attach exactly contribution_amount in usaf as join deposit (locked as security)
     JoinCircle {
         circle_id: u64,
     },
-    LockJoinDeposit {
+    /// Accept an invite — must attach exactly contribution_amount in usaf as join deposit
+    AcceptInvite {
         circle_id: u64,
     },
     InviteMember {
         circle_id: u64,
         member_address: Addr,
     },
-    AcceptInvite {
-        circle_id: u64,
-    },
+    /// Exit circle. Before start: full refund. After start (strict_mode=false only): refund locked minus accumulated late fees minus exit penalty.
     ExitCircle {
         circle_id: u64,
     },
     StartCircle {
         circle_id: u64,
     },
+    /// Deposit contribution for current round. Attach exactly contribution_amount usaf. Late deposits are accepted — late fee is tracked against locked amount.
     DepositContribution {
         circle_id: u64,
     },
+    /// Trigger round payout. Anyone can call when manual_trigger_enabled=false and now>=next_payout_date.
     ProcessPayout {
+        circle_id: u64,
+    },
+    /// Withdraw all pending (accumulated) payouts owed to caller. Callable anytime by any member who has pending payouts.
+    Withdraw {
+        circle_id: u64,
+    },
+    /// Permissionless: check all members for ejection condition (accumulated_late_fees + exit_penalty >= locked) and eject automatically.
+    CheckAndEject {
         circle_id: u64,
     },
     PauseCircle {
@@ -89,6 +96,7 @@ pub enum ExecuteMsg {
     EmergencyStop {
         circle_id: u64,
     },
+    /// Cancel circle. Before start: full refunds. During Running: creator forfeits creator_lock_amount distributed to active members; all deposits for current cycle refunded.
     CancelCircle {
         circle_id: u64,
     },
@@ -99,7 +107,7 @@ pub enum ExecuteMsg {
         circle_image: Option<String>,
     },
     WithdrawPlatformFees {
-        circle_id: Option<u64>, // If None, withdraw all
+        circle_id: Option<u64>,
     },
     // Private Circle and Member Management
     AddPrivateMember {
@@ -121,6 +129,17 @@ pub enum ExecuteMsg {
         circle_id: u64,
         cycle: u32,
     },
+    // Staking
+    EnableStaking {
+        circle_id: u64,
+        validator_address: String,
+    },
+    DisableStaking {
+        circle_id: u64,
+    },
+    ClaimPendingRefund {
+        circle_id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -136,29 +155,33 @@ pub enum QueryMsg {
     },
     GetCircleMembers { circle_id: u64 },
     GetCircleStatus { circle_id: u64 },
-    
+
     // Cycle Queries
     GetCurrentCycle { circle_id: u64 },
     GetCycleDeposits { circle_id: u64, cycle: u32 },
     GetMemberDeposits { circle_id: u64, member: Addr },
-    
+
     // Payout Queries
     GetPayouts { circle_id: u64 },
     GetPayoutHistory { circle_id: u64, cycle: Option<u32> },
-    
+
     // Financial Queries
     GetCircleBalance { circle_id: u64 },
     GetMemberBalance { circle_id: u64, member: Addr },
     GetPenalties { circle_id: u64, member: Option<Addr> },
     GetRefunds { circle_id: u64 },
-    
+
+    // Pending payouts and late fees
+    GetPendingPayout { circle_id: u64, member: Addr },
+    GetMemberAccumulatedLateFees { circle_id: u64, member: Addr },
+
     // Event Queries
     GetEvents { circle_id: u64, limit: Option<u32> },
-    
+
     // Statistics
     GetCircleStats { circle_id: u64 },
     GetMemberStats { circle_id: u64, member: Addr },
-    
+
     // Locking and Private Circle Queries
     GetMemberLockedAmount { circle_id: u64, member: Addr },
     GetBlockedMembers { circle_id: u64 },
@@ -166,6 +189,12 @@ pub enum QueryMsg {
     GetPrivateMembers { circle_id: u64 },
     GetDistributionCalendar { circle_id: u64 },
     GetArchivedDate { circle_id: u64 },
+    // Staking
+    GetCircleStakingInfo { circle_id: u64 },
+    GetPendingRefunds {
+        circle_id: u64,
+        member: Option<Addr>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -238,6 +267,7 @@ pub struct CircleStatsResponse {
     pub total_payouts: Uint128,
     pub total_penalties: Uint128,
     pub total_platform_fees: Uint128,
+    pub total_pending_payouts: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -248,6 +278,8 @@ pub struct MemberStatsResponse {
     pub total_received: Uint128,
     pub total_penalties: Uint128,
     pub missed_payments: u32,
+    pub pending_payout: Uint128,
+    pub accumulated_late_fees: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -257,7 +289,7 @@ pub struct MemberLockedAmountResponse {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct BlockedMembersResponse {
-    pub blocked_members: Vec<(Addr, u32)>, // (member_address, blocked_from_cycle)
+    pub blocked_members: Vec<(Addr, u32)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -281,6 +313,7 @@ pub struct CalendarRound {
     pub cycle_number: u32,
     pub deposit_deadline: Timestamp,
     pub distribution_date: Timestamp,
+    pub distribution_occurs: bool,
     pub recipient: Option<Addr>,
 }
 
@@ -289,3 +322,35 @@ pub struct ArchivedDateResponse {
     pub archived_date: Option<Timestamp>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PendingPayoutResponse {
+    pub amount: Uint128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct AccumulatedLateFeesResponse {
+    pub amount: Uint128,
+    /// Number of rounds currently used to calculate (missed_rounds * late_fee_per_round)
+    pub missed_rounds: u32,
+    pub late_fee_per_round: Uint128,
+    pub exit_penalty: Uint128,
+    pub locked_amount: Uint128,
+    /// Rounds remaining before ejection
+    pub rounds_until_ejection: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct CircleStakingInfoResponse {
+    pub enabled: bool,
+    pub validator_address: Option<String>,
+    pub staked_amount: Uint128,
+    pub total_rewards_earned: Uint128,
+    pub rewards_accumulated: Uint128,
+    pub last_claim_at: Option<Timestamp>,
+    pub pending_undelegations: Vec<crate::state::PendingUndelegation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct PendingRefundsResponse {
+    pub refunds: Vec<crate::state::PendingRefundRecord>,
+}

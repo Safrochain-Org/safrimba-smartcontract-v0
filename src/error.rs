@@ -30,7 +30,10 @@ pub enum ContractError {
     #[error("Circle has not started yet")]
     CircleNotStarted { circle_id: u64 },
 
-    #[error("Circle has already started. Member exit not allowed")]
+    #[error("Circle has already started. Exit not allowed in strict mode")]
+    StrictModeNoExit { circle_id: u64 },
+
+    #[error("Exit not allowed")]
     ExitNotAllowed { circle_id: u64 },
 
     #[error("Minimum members not met. Required: {required}, Current: {current}")]
@@ -41,9 +44,6 @@ pub enum ContractError {
 
     #[error("Member has not paid for this cycle")]
     PaymentMissing { address: String, cycle: u32 },
-
-    #[error("Member is late. Grace period ended")]
-    MemberLate { address: String },
 
     #[error("Maximum missed payments exceeded: {max}")]
     MaxMissedPaymentsExceeded { max: u32 },
@@ -57,12 +57,12 @@ pub enum ContractError {
     #[error("Emergency stop is active")]
     EmergencyStopActive {},
 
-    #[error("Arbiter only action")]
-    ArbiterOnly {},
-
     #[error("Invalid parameters: {msg}")]
     InvalidParameters { msg: String },
 
     #[error("Deposit already made for this cycle")]
     AlreadyDeposited { address: String, cycle: u32 },
+
+    #[error("No pending payouts available for withdrawal")]
+    NoPendingPayouts {},
 }

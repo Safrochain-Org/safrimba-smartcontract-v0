@@ -9,7 +9,8 @@ use crate::query::{
     query_member_balance, query_member_deposits, query_member_stats, query_payout_history,
     query_payouts, query_penalties, query_refunds, query_circles, query_member_locked_amount,
     query_blocked_members, query_member_pseudonym, query_private_members,
-    query_distribution_calendar, query_archived_date,
+    query_distribution_calendar, query_archived_date, query_pending_payout,
+    query_member_accumulated_late_fees, query_circle_staking_info, query_pending_refunds,
 };
 use crate::state::PlatformConfig;
 
@@ -124,6 +125,20 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
         QueryMsg::GetArchivedDate { circle_id } => {
             cosmwasm_std::to_json_binary(&query_archived_date(deps, env, circle_id)?)
+        }
+        QueryMsg::GetPendingPayout { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_pending_payout(deps, env, circle_id, member)?)
+        }
+        QueryMsg::GetMemberAccumulatedLateFees { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_member_accumulated_late_fees(
+                deps, env, circle_id, member,
+            )?)
+        }
+        QueryMsg::GetCircleStakingInfo { circle_id } => {
+            cosmwasm_std::to_json_binary(&query_circle_staking_info(deps, env, circle_id)?)
+        }
+        QueryMsg::GetPendingRefunds { circle_id, member } => {
+            cosmwasm_std::to_json_binary(&query_pending_refunds(deps, env, circle_id, member)?)
         }
     }
 }
