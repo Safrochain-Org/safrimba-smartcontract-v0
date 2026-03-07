@@ -1,8 +1,8 @@
 use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
-use cw2::set_contract_version;
+use cw2::{get_contract_version, set_contract_version};
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::query::{
     query_circle, query_circle_balance, query_circle_members, query_circle_stats,
     query_circle_status, query_current_cycle, query_cycle_deposits, query_deposit_requirement,
@@ -50,6 +50,19 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     crate::execute::execute(deps, env, info, msg)
+}
+
+#[entry_point]
+pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+    let version = get_contract_version(deps.storage)?;
+    set_contract_version(
+        deps.storage,
+        CONTRACT_NAME,
+        CONTRACT_VERSION,
+    )?;
+    Ok(Response::new()
+        .add_attribute("previous_version", version.version)
+        .add_attribute("new_version", CONTRACT_VERSION))
 }
 
 #[entry_point]

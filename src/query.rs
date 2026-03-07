@@ -556,7 +556,7 @@ pub fn query_distribution_calendar(
     // When the first distribution happens: None => round 1; Total => 100% of all members (last round only); MinMembers(N) => from round N to end of cycle.
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
         None => 1,
-        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::Total {}) => circle.max_members,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
     

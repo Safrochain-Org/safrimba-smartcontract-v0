@@ -386,7 +386,7 @@ fn execute_create_circle(
 
     // Force distribution_threshold = Total for Public circles
     let effective_threshold = match visibility {
-        Visibility::Public => Some(DistributionThreshold::Total),
+        Visibility::Public => Some(DistributionThreshold::Total {}),
         Visibility::Private => {
             if let Some(DistributionThreshold::MinMembers { count }) = distribution_threshold {
                 if count == 0 {
@@ -1538,7 +1538,7 @@ fn execute_process_payout(
     let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
     let min_round_for_distribution = match circle.distribution_threshold {
         None => 1u32,
-        Some(DistributionThreshold::Total) => active_count,
+        Some(DistributionThreshold::Total {}) => active_count,
         Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
     };
 
@@ -1829,7 +1829,7 @@ fn execute_advance_round(
     let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
     let min_round_for_distribution = match circle.distribution_threshold {
         None => 1u32,
-        Some(DistributionThreshold::Total) => active_count,
+        Some(DistributionThreshold::Total {}) => active_count,
         Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
     };
 
@@ -3169,7 +3169,7 @@ fn generate_payout_order(circle: &mut Circle, env: &Env) {
 fn build_distribution_calendar(circle: &Circle, start_timestamp: Timestamp) -> String {
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
         None => 1,
-        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::Total {}) => circle.max_members,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
 

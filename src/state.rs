@@ -119,7 +119,8 @@ pub enum RefundMode {
 #[serde(rename_all = "snake_case")]
 pub enum DistributionThreshold {
     /// 100% of all members: one distribution only at the last round of each cycle.
-    Total,
+    /// Struct variant (empty) for reliable JSON: {"total": {}}
+    Total {},
     /// Wait `count` rounds, then one distribution per round through end of cycle.
     MinMembers { count: u32 },
 }
