@@ -2089,6 +2089,17 @@ fn execute_advance_round(
         .cloned()
         .collect();
 
+    // Match ProcessPayout semantics: if members are still missing, do not apply
+    // missed-payment late fees before due date + grace period.
+    if let Some(next_payout) = circle.next_payout_date {
+        let grace_end = next_payout.plus_seconds(circle.grace_period_secs());
+        if env.block.time <= grace_end && !missing_members.is_empty() {
+            return Err(ContractError::InvalidParameters {
+                msg: "Grace period not ended for all missing members".to_string(),
+            });
+        }
+    }
+
     let mut locked_used_in_advance = Uint128::zero();
     for member in &missing_members {
         let late_fee_per_round =
