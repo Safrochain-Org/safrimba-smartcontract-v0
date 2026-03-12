@@ -40,11 +40,17 @@ pub struct Circle {
     // Cycle & Time Parameters
     pub total_cycles: u32,
     pub cycle_duration_days: u32,
+    /// When > 0, overrides cycle_duration_days (for dev/testing with minutes/hours)
+    #[serde(default)]
+    pub cycle_duration_seconds: u64,
     pub start_date: Option<Timestamp>,
     pub first_cycle_date: Option<Timestamp>,
     pub next_payout_date: Option<Timestamp>,
     pub end_date: Option<Timestamp>,
     pub grace_period_hours: u32,
+    /// When > 0, overrides grace_period_hours (for dev/testing with minutes)
+    #[serde(default)]
+    pub grace_period_seconds: u64,
     pub auto_start_when_full: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_start_type: Option<String>, // "by_members" or "by_date"
@@ -89,6 +95,25 @@ pub struct Circle {
     pub show_member_identities: bool,
 }
 
+impl Circle {
+    /// Effective cycle duration in seconds (supports days or seconds override for dev/testing)
+    pub fn cycle_duration_secs(&self) -> u64 {
+        if self.cycle_duration_seconds > 0 {
+            self.cycle_duration_seconds
+        } else {
+            self.cycle_duration_days as u64 * 86400
+        }
+    }
+    /// Effective grace period in seconds (supports hours or seconds override for dev/testing)
+    pub fn grace_period_secs(&self) -> u64 {
+        if self.grace_period_seconds > 0 {
+            self.grace_period_seconds
+        } else {
+            self.grace_period_hours as u64 * 3600
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub enum CircleStatus {
     Draft,
@@ -96,6 +121,8 @@ pub enum CircleStatus {
     Full,
     Running,
     Paused,
+    /// All cycles done, final distribution to PENDING_PAYOUTS done; awaiting withdrawals. Becomes Completed when contract balance = 0.
+    Finalizing,
     Completed,
     Cancelled,
 }
@@ -179,6 +206,9 @@ pub struct MemberMissedPayments {
     pub member: Addr,
     pub missed_count: u32,
     pub last_missed_cycle: Option<u32>,
+    /// Absolute round index where last late fee was applied (prevents double-counting within same round)
+    #[serde(default)]
+    pub last_fee_round: Option<u32>,
 }
 
 // Platform configuration stored at contract level
@@ -214,11 +244,18 @@ pub struct PendingRefundRecord {
     pub available_at: Timestamp,
 }
 
+// --- INVARIANTS (must hold after every execute) ---
+// total_pending_payouts == sum(PENDING_PAYOUTS for all members of circle)
+// total_amount_locked == creator_lock_amount + sum(MEMBER_LOCKED_AMOUNTS for circle)
+//   (creator has no MEMBER_LOCKED_AMOUNTS entry; their lock is in circle.creator_lock_amount only)
+// total_penalties_collected == sum of PENALTIES amounts for circle (informational; not enforced)
+
 // Storage
 pub const PLATFORM_CONFIG: Item<PlatformConfig> = Item::new("platform_config");
 pub const CIRCLE_COUNTER: Item<u64> = Item::new("circle_counter");
 pub const CIRCLES: Map<u64, Circle> = Map::new("circles");
-pub const PAYOUTS: Map<(u64, u32), PayoutRecord> = Map::new("payouts");
+/// Payouts: (circle_id, cycle, recipient) — supports multiple recipients per cycle (Total threshold)
+pub const PAYOUTS: Map<(u64, u32, Addr), PayoutRecord> = Map::new("payouts");
 pub const DEPOSITS: Map<(u64, Addr, u32), DepositRecord> = Map::new("deposits");
 pub const PENALTIES: Map<(u64, Addr, u32), PenaltyRecord> = Map::new("penalties");
 pub const REFUNDS: Map<(u64, Addr), RefundRecord> = Map::new("refunds");

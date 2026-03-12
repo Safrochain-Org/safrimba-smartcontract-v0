@@ -127,7 +127,11 @@ pub fn query_payouts(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Payouts
     let mut payouts = vec![];
 
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             payouts.push(payout);
         }
     }
@@ -142,9 +146,13 @@ pub fn query_payout_history(
     cycle: Option<u32>,
 ) -> StdResult<PayoutsResponse> {
     if let Some(cycle_num) = cycle {
-        let payout = PAYOUTS.may_load(deps.storage, (circle_id, cycle_num))?;
+        let payouts: StdResult<Vec<_>> = PAYOUTS
+            .prefix((circle_id, cycle_num))
+            .range(deps.storage, None, None, Order::Ascending)
+            .map(|item| item.map(|(_, p)| p))
+            .collect();
         Ok(PayoutsResponse {
-            payouts: payout.into_iter().collect(),
+            payouts: payouts?,
         })
     } else {
         query_payouts(deps, _env, circle_id)
@@ -187,7 +195,11 @@ pub fn query_member_balance(
 
     // Calculate total received from payouts
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             if payout.recipient == member {
                 total_received = total_received
                     .checked_add(payout.amount)
@@ -277,7 +289,11 @@ pub fn query_circle_stats(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Ci
     
     let mut total_payouts = Uint128::zero();
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             total_payouts = total_payouts
                 .checked_add(payout.amount)
                 .unwrap_or(total_payouts);
@@ -335,7 +351,11 @@ pub fn query_member_stats(
 
     // Calculate received
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             if payout.recipient == member {
                 total_received = total_received
                     .checked_add(payout.amount)
@@ -400,6 +420,7 @@ pub fn query_member_accumulated_late_fees(
             member: member.clone(),
             missed_count: 0,
             last_missed_cycle: None,
+            last_fee_round: None,
         });
 
     let total_deduction_so_far = amount + exit_penalty;
@@ -569,12 +590,12 @@ pub fn query_distribution_calendar(
                 let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
                 let distribution_occurs = round_in_cycle >= min_round_for_distribution;
                 
-                let round_offset_seconds = ((round_number - 1) * circle.cycle_duration_days as u32) * 86400;
+                let round_offset_seconds = (round_number - 1) as u64 * circle.cycle_duration_secs();
                 let deposit_deadline = Timestamp::from_seconds(
-                    start_timestamp.seconds() + round_offset_seconds as u64
+                    start_timestamp.seconds() + round_offset_seconds
                 );
                 let distribution_date = Timestamp::from_seconds(
-                    start_timestamp.seconds() + round_offset_seconds as u64 + (circle.cycle_duration_days as u64 * 86400)
+                    start_timestamp.seconds() + round_offset_seconds + circle.cycle_duration_secs()
                 );
                 
                 rounds.push(CalendarRound {
@@ -603,9 +624,9 @@ pub fn query_archived_date(
 ) -> StdResult<ArchivedDateResponse> {
     let circle = CIRCLES.load(deps.storage, circle_id)?;
     
-    let archived_date = if let (Some(end_date), grace_period_hours) = (circle.end_date, circle.grace_period_hours) {
+    let archived_date = if let Some(end_date) = circle.end_date {
         Some(Timestamp::from_seconds(
-            end_date.seconds() + (grace_period_hours as u64 * 3600)
+            end_date.seconds() + circle.grace_period_secs()
         ))
     } else {
         None

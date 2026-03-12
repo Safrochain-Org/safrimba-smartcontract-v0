@@ -32,9 +32,15 @@ pub enum ExecuteMsg {
         late_fee_percent: u64,
         total_cycles: u32,
         cycle_duration_days: u32,
+        /// Override: when set, use this instead of cycle_duration_days (for dev/testing with minutes/hours)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cycle_duration_seconds: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         start_date: Option<Timestamp>,
         grace_period_hours: u32,
+        /// Override: when set, use this instead of grace_period_hours (for dev/testing with minutes)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        grace_period_seconds: Option<u64>,
         auto_start_when_full: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_start_type: Option<String>,
@@ -145,6 +151,10 @@ pub enum ExecuteMsg {
         circle_id: u64,
     },
     ClaimPendingRefund {
+        circle_id: u64,
+    },
+    /// When circle is Finalizing and has staked tokens, undelegate so they become available for withdrawal (after unbonding period). Callable by anyone.
+    UndelegateForWithdrawals {
         circle_id: u64,
     },
 }
