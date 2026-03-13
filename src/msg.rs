@@ -213,6 +213,9 @@ pub enum QueryMsg {
         circle_id: u64,
         member: Option<Addr>,
     },
+
+    /// Returns the contract API version (e.g. 2 for v2). Frontend uses this to choose capabilities.
+    GetContractVersion {},
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -380,4 +383,10 @@ pub struct CircleStakingInfoResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PendingRefundsResponse {
     pub refunds: Vec<crate::state::PendingRefundRecord>,
+}
+
+/// Returned by GetContractVersion. api_version 1 = v1, 2 = v2; frontend maps to capabilities.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct ContractVersionResponse {
+    pub api_version: u8,
 }

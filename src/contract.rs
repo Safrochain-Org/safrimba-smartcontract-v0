@@ -2,7 +2,7 @@ use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Respons
 use cw2::{get_contract_version, set_contract_version};
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
+use crate::msg::{ContractVersionResponse, ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::query::{
     query_circle, query_circle_balance, query_circle_members, query_circle_stats,
     query_circle_status, query_current_cycle, query_cycle_deposits, query_deposit_requirement,
@@ -16,6 +16,8 @@ use crate::state::PlatformConfig;
 
 const CONTRACT_NAME: &str = "crates.io:safrimba-contract";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// API version for frontend capabilities: 1 = v1 (join + lock_deposit), 2 = v2 (join with funds, pending payouts, etc.)
+const CONTRACT_API_VERSION: u8 = 2;
 
 #[entry_point]
 pub fn instantiate(
@@ -158,6 +160,9 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetPendingRefunds { circle_id, member } => {
             cosmwasm_std::to_json_binary(&query_pending_refunds(deps, env, circle_id, member)?)
         }
+        QueryMsg::GetContractVersion {} => cosmwasm_std::to_json_binary(&ContractVersionResponse {
+            api_version: CONTRACT_API_VERSION,
+        }),
     }
 }
 
