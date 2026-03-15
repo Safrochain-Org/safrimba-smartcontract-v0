@@ -11,6 +11,9 @@ pub struct InstantiateMsg {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct MigrateMsg {}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg {
     // Circle Management
@@ -29,9 +32,15 @@ pub enum ExecuteMsg {
         late_fee_percent: u64,
         total_cycles: u32,
         cycle_duration_days: u32,
+        /// Override: when set, use this instead of cycle_duration_days (for dev/testing with minutes/hours)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cycle_duration_seconds: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         start_date: Option<Timestamp>,
         grace_period_hours: u32,
+        /// Override: when set, use this instead of grace_period_hours (for dev/testing with minutes)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        grace_period_seconds: Option<u64>,
         auto_start_when_full: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_start_type: Option<String>,
@@ -77,6 +86,10 @@ pub enum ExecuteMsg {
     },
     /// Trigger round payout. Anyone can call when manual_trigger_enabled=false and now>=next_payout_date.
     ProcessPayout {
+        circle_id: u64,
+    },
+    /// Advance to next round without payout. Callable when all deposited and round_in_cycle < min_round_for_distribution (e.g. Total threshold at round 1).
+    AdvanceRound {
         circle_id: u64,
     },
     /// Withdraw all pending (accumulated) payouts owed to caller. Callable anytime by any member who has pending payouts.
@@ -140,6 +153,10 @@ pub enum ExecuteMsg {
     ClaimPendingRefund {
         circle_id: u64,
     },
+    /// When circle is Finalizing and has staked tokens, undelegate so they become available for withdrawal (after unbonding period). Callable by anyone.
+    UndelegateForWithdrawals {
+        circle_id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -174,6 +191,7 @@ pub enum QueryMsg {
     // Pending payouts and late fees
     GetPendingPayout { circle_id: u64, member: Addr },
     GetMemberAccumulatedLateFees { circle_id: u64, member: Addr },
+    GetDepositRequirement { circle_id: u64, member: Addr },
 
     // Event Queries
     GetEvents { circle_id: u64, limit: Option<u32> },
@@ -195,6 +213,9 @@ pub enum QueryMsg {
         circle_id: u64,
         member: Option<Addr>,
     },
+
+    /// Returns the contract API version (e.g. 2 for v2). Frontend uses this to choose capabilities.
+    GetContractVersion {},
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -340,6 +361,15 @@ pub struct AccumulatedLateFeesResponse {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct DepositRequirementResponse {
+    pub required_amount: Uint128,
+    pub missed_rounds: u32,
+    pub can_deposit: bool,
+    pub contribution_amount: Uint128,
+    pub late_fee_total: Uint128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct CircleStakingInfoResponse {
     pub enabled: bool,
     pub validator_address: Option<String>,
@@ -353,4 +383,10 @@ pub struct CircleStakingInfoResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PendingRefundsResponse {
     pub refunds: Vec<crate::state::PendingRefundRecord>,
+}
+
+/// Returned by GetContractVersion. api_version 1 = v1, 2 = v2; frontend maps to capabilities.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct ContractVersionResponse {
+    pub api_version: u8,
 }

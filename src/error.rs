@@ -65,4 +65,13 @@ pub enum ContractError {
 
     #[error("No pending payouts available for withdrawal")]
     NoPendingPayouts {},
+
+    #[error("Contract balance insufficient for payout. Required: {required}, Available: {available}")]
+    InsufficientContractBalance { required: String, available: String },
+
+    #[error("Payout already processed for this cycle")]
+    PayoutAlreadyProcessed { cycle: u32 },
+
+    #[error("Cannot cancel: at least one distribution has occurred. Circle must complete or use emergency procedures.")]
+    CancelNotAllowedAfterDistribution {},
 }

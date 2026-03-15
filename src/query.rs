@@ -3,8 +3,8 @@ use cw_storage_plus::Bound;
 
 use crate::msg::{
     AccumulatedLateFeesResponse, BalanceResponse, CircleResponse, CirclesResponse, CycleResponse,
-    DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse, PayoutsResponse,
-    PenaltiesResponse, PendingPayoutResponse, PendingRefundsResponse, RefundsResponse,
+    DepositRequirementResponse, DepositsResponse, EventsResponse, MemberStatsResponse, MembersResponse,
+    PayoutsResponse, PenaltiesResponse, PendingPayoutResponse, PendingRefundsResponse, RefundsResponse,
     StatusResponse, CircleStatsResponse, CircleStakingInfoResponse, MemberLockedAmountResponse,
     BlockedMembersResponse, MemberPseudonymResponse, PrivateMembersResponse,
     DistributionCalendarResponse, ArchivedDateResponse, CalendarRound,
@@ -12,8 +12,8 @@ use crate::msg::{
 use crate::state::{
     Circle, CircleStatus, CIRCLES, CIRCLE_STAKING, DEPOSITS, EVENTS, EVENT_COUNTER, PAYOUTS,
     PENALTIES, PENDING_REFUNDS, REFUNDS, MEMBER_LOCKED_AMOUNTS, MEMBER_ACCUMULATED_LATE_FEES,
-    MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS, PRIVATE_MEMBER_LIST, PENDING_PAYOUTS,
-    DistributionThreshold,
+    MEMBER_LAST_DEPOSITED_CYCLE, MEMBER_MISSED_PAYMENTS, BLOCKED_MEMBERS, MEMBER_PSEUDONYMS,
+    PRIVATE_MEMBER_LIST, PENDING_PAYOUTS, DistributionThreshold,
 };
 
 pub fn query_circle(deps: Deps, _env: Env, circle_id: u64) -> StdResult<CircleResponse> {
@@ -127,7 +127,11 @@ pub fn query_payouts(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Payouts
     let mut payouts = vec![];
 
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             payouts.push(payout);
         }
     }
@@ -142,9 +146,13 @@ pub fn query_payout_history(
     cycle: Option<u32>,
 ) -> StdResult<PayoutsResponse> {
     if let Some(cycle_num) = cycle {
-        let payout = PAYOUTS.may_load(deps.storage, (circle_id, cycle_num))?;
+        let payouts: StdResult<Vec<_>> = PAYOUTS
+            .prefix((circle_id, cycle_num))
+            .range(deps.storage, None, None, Order::Ascending)
+            .map(|item| item.map(|(_, p)| p))
+            .collect();
         Ok(PayoutsResponse {
-            payouts: payout.into_iter().collect(),
+            payouts: payouts?,
         })
     } else {
         query_payouts(deps, _env, circle_id)
@@ -187,7 +195,11 @@ pub fn query_member_balance(
 
     // Calculate total received from payouts
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             if payout.recipient == member {
                 total_received = total_received
                     .checked_add(payout.amount)
@@ -277,7 +289,11 @@ pub fn query_circle_stats(deps: Deps, _env: Env, circle_id: u64) -> StdResult<Ci
     
     let mut total_payouts = Uint128::zero();
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             total_payouts = total_payouts
                 .checked_add(payout.amount)
                 .unwrap_or(total_payouts);
@@ -335,7 +351,11 @@ pub fn query_member_stats(
 
     // Calculate received
     for cycle in 1..=circle.cycles_completed {
-        if let Ok(Some(payout)) = PAYOUTS.may_load(deps.storage, (circle_id, cycle)) {
+        for item in PAYOUTS
+            .prefix((circle_id, cycle))
+            .range(deps.storage, None, None, Order::Ascending)
+        {
+            let (_, payout) = item?;
             if payout.recipient == member {
                 total_received = total_received
                     .checked_add(payout.amount)
@@ -400,6 +420,7 @@ pub fn query_member_accumulated_late_fees(
             member: member.clone(),
             missed_count: 0,
             last_missed_cycle: None,
+            last_fee_round: None,
         });
 
     let total_deduction_so_far = amount + exit_penalty;
@@ -417,6 +438,62 @@ pub fn query_member_accumulated_late_fees(
         exit_penalty,
         locked_amount,
         rounds_until_ejection,
+    })
+}
+
+pub fn query_deposit_requirement(
+    deps: Deps,
+    _env: Env,
+    circle_id: u64,
+    member: Addr,
+) -> StdResult<DepositRequirementResponse> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    let blocked = BLOCKED_MEMBERS
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .map(|bc| bc <= circle.current_cycle_index)
+        .unwrap_or(false);
+
+    let already_deposited = DEPOSITS
+        .may_load(deps.storage, (circle_id, member.clone(), circle.current_cycle_index))?
+        .is_some();
+
+    let last_deposited_cycle = MEMBER_LAST_DEPOSITED_CYCLE
+        .may_load(deps.storage, (circle_id, member.clone()))?
+        .or_else(|| {
+            DEPOSITS
+                .prefix((circle_id, member.clone()))
+                .range(deps.storage, None, None, Order::Descending)
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(c, _)| c)
+        })
+        .unwrap_or(0);
+
+    let rounds_missed = circle
+        .current_cycle_index
+        .saturating_sub(last_deposited_cycle)
+        .saturating_sub(1);
+
+    let late_fee_per_round = circle
+        .contribution_amount
+        .multiply_ratio(circle.late_fee_percent, 10000u64);
+    let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+    let required_amount = circle
+        .contribution_amount
+        .checked_add(late_fee_total)
+        .unwrap_or(circle.contribution_amount);
+
+    let can_deposit = !blocked
+        && !already_deposited
+        && rounds_missed < circle.max_missed_payments_allowed;
+
+    Ok(DepositRequirementResponse {
+        required_amount,
+        missed_rounds: rounds_missed,
+        can_deposit,
+        contribution_amount: circle.contribution_amount,
+        late_fee_total,
     })
 }
 
@@ -500,7 +577,7 @@ pub fn query_distribution_calendar(
     // When the first distribution happens: None => round 1; Total => 100% of all members (last round only); MinMembers(N) => from round N to end of cycle.
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
         None => 1,
-        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::Total {}) => circle.max_members,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
     
@@ -513,12 +590,12 @@ pub fn query_distribution_calendar(
                 let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
                 let distribution_occurs = round_in_cycle >= min_round_for_distribution;
                 
-                let round_offset_seconds = ((round_number - 1) * circle.cycle_duration_days as u32) * 86400;
+                let round_offset_seconds = (round_number - 1) as u64 * circle.cycle_duration_secs();
                 let deposit_deadline = Timestamp::from_seconds(
-                    start_timestamp.seconds() + round_offset_seconds as u64
+                    start_timestamp.seconds() + round_offset_seconds
                 );
                 let distribution_date = Timestamp::from_seconds(
-                    start_timestamp.seconds() + round_offset_seconds as u64 + (circle.cycle_duration_days as u64 * 86400)
+                    start_timestamp.seconds() + round_offset_seconds + circle.cycle_duration_secs()
                 );
                 
                 rounds.push(CalendarRound {
@@ -547,9 +624,9 @@ pub fn query_archived_date(
 ) -> StdResult<ArchivedDateResponse> {
     let circle = CIRCLES.load(deps.storage, circle_id)?;
     
-    let archived_date = if let (Some(end_date), grace_period_hours) = (circle.end_date, circle.grace_period_hours) {
+    let archived_date = if let Some(end_date) = circle.end_date {
         Some(Timestamp::from_seconds(
-            end_date.seconds() + (grace_period_hours as u64 * 3600)
+            end_date.seconds() + circle.grace_period_secs()
         ))
     } else {
         None

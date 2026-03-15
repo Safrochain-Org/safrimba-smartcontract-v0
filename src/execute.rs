@@ -10,9 +10,9 @@ use crate::state::{
     Circle, CircleStakingConfig, CircleStatus, DepositRecord, DistributionThreshold, EventLog,
     MemberMissedPayments, PayoutOrderType, PayoutRecord, PendingRefundRecord, PendingUndelegation,
     PenaltyRecord, RefundMode, Visibility, BLOCKED_MEMBERS, CIRCLE_COUNTER, CIRCLES, CIRCLE_STAKING,
-    DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LOCKED_AMOUNTS,
-    MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES, PENDING_PAYOUTS, PENDING_REFUNDS,
-    PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
+    DEPOSITS, EVENTS, EVENT_COUNTER, MEMBER_ACCUMULATED_LATE_FEES, MEMBER_LAST_DEPOSITED_CYCLE,
+    MEMBER_LOCKED_AMOUNTS, MEMBER_MISSED_PAYMENTS, MEMBER_PSEUDONYMS, PAYOUTS, PENALTIES,
+    PENDING_PAYOUTS, PENDING_REFUNDS, PLATFORM_CONFIG, PRIVATE_MEMBER_LIST,
 };
 
 pub fn execute(
@@ -34,8 +34,10 @@ pub fn execute(
             late_fee_percent,
             total_cycles,
             cycle_duration_days,
+            cycle_duration_seconds,
             start_date,
             grace_period_hours,
+            grace_period_seconds,
             auto_start_when_full,
             auto_start_type,
             auto_start_date,
@@ -64,8 +66,10 @@ pub fn execute(
             late_fee_percent,
             total_cycles,
             cycle_duration_days,
+            cycle_duration_seconds,
             start_date,
             grace_period_hours,
+            grace_period_seconds,
             auto_start_when_full,
             auto_start_type,
             auto_start_date,
@@ -94,6 +98,7 @@ pub fn execute(
         ExecuteMsg::ProcessPayout { circle_id } => {
             execute_process_payout(deps, env, info, circle_id)
         }
+        ExecuteMsg::AdvanceRound { circle_id } => execute_advance_round(deps, env, info, circle_id),
         ExecuteMsg::Withdraw { circle_id } => execute_withdraw(deps, env, info, circle_id),
         ExecuteMsg::CheckAndEject { circle_id } => {
             execute_check_and_eject(deps, env, info, circle_id)
@@ -152,6 +157,9 @@ pub fn execute(
         ExecuteMsg::ClaimPendingRefund { circle_id } => {
             execute_claim_pending_refund(deps, env, info, circle_id)
         }
+        ExecuteMsg::UndelegateForWithdrawals { circle_id } => {
+            execute_undelegate_for_withdrawals(deps, env, info, circle_id)
+        }
     }
 }
 
@@ -159,14 +167,13 @@ pub fn execute(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute required creator lock: contribution * (1 + max_members * 10%) = contribution * (10000 + max_members * 1000) / 10000
-fn compute_creator_lock(contribution: Uint128, max_members: u32) -> Result<Uint128, ContractError> {
-    let numerator = contribution
-        .checked_mul(Uint128::from(10000u64 + max_members as u64 * 1000u64))
+/// Compute required creator lock: contribution_amount * 2
+fn compute_creator_lock(contribution: Uint128, _max_members: u32) -> Result<Uint128, ContractError> {
+    contribution
+        .checked_mul(Uint128::from(2u64))
         .map_err(|_| ContractError::InvalidParameters {
             msg: "Creator lock overflow".to_string(),
-        })?;
-    Ok(numerator.multiply_ratio(1u128, 10000u128))
+        })
 }
 
 /// Compute late fee per round: contribution * late_fee_percent / 10000
@@ -219,23 +226,36 @@ fn compute_max_missed(exit_penalty_percent: u64, late_fee_percent: u64) -> u32 {
     compute_max_missed_base(exit_penalty_percent, late_fee_percent)
 }
 
-/// Check if member meets ejection condition: accumulated_late_fees + exit_penalty >= locked_amount.
+/// Get the original locked amount for a member (what they deposited at join time).
+/// Creator's lock = creator_lock_amount; other members = contribution_amount.
+fn original_lock_for_member(circle: &Circle, member: &Addr) -> Uint128 {
+    if member == &circle.creator_address {
+        circle.creator_lock_amount
+    } else {
+        circle.contribution_amount
+    }
+}
+
+/// Check if member meets ejection condition: accumulated_late_fees + exit_penalty >= original_lock.
+/// Uses `original_lock` (the amount the member deposited at join time) rather than the
+/// remaining locked balance, since locked funds may have been partially consumed to cover
+/// missed deposits via `use_locked_amount_for_member`.
 fn should_eject_member(
     storage: &dyn Storage,
     circle_id: u64,
     member: &Addr,
-    locked_amount: Uint128,
+    original_lock: Uint128,
     exit_penalty_percent: u64,
 ) -> bool {
-    if locked_amount.is_zero() {
+    if original_lock.is_zero() {
         return false;
     }
     let accumulated = MEMBER_ACCUMULATED_LATE_FEES
         .may_load(storage, (circle_id, member.clone()))
         .unwrap_or(None)
         .unwrap_or(Uint128::zero());
-    let exit_penalty = compute_exit_penalty(locked_amount, exit_penalty_percent);
-    accumulated + exit_penalty >= locked_amount
+    let exit_penalty = compute_exit_penalty(original_lock, exit_penalty_percent);
+    accumulated + exit_penalty >= original_lock
 }
 
 /// Eject a member from a running circle: remove from members_list, record in BLOCKED_MEMBERS, keep locked funds in pool, emit event.
@@ -282,6 +302,7 @@ fn eject_member_from_circle(
             member: member.clone(),
             missed_count: 0,
             last_missed_cycle: None,
+            last_fee_round: None,
         });
     missed.last_missed_cycle = Some(circle.current_cycle_index);
     MEMBER_MISSED_PAYMENTS.save(deps.storage, (circle.circle_id, member.clone()), &missed)?;
@@ -332,8 +353,10 @@ fn execute_create_circle(
     late_fee_percent: u64,
     total_cycles: u32,
     cycle_duration_days: u32,
+    cycle_duration_seconds: Option<u64>,
     start_date: Option<Timestamp>,
     grace_period_hours: u32,
+    grace_period_seconds: Option<u64>,
     auto_start_when_full: bool,
     auto_start_type: Option<String>,
     auto_start_date: Option<Timestamp>,
@@ -386,7 +409,7 @@ fn execute_create_circle(
 
     // Force distribution_threshold = Total for Public circles
     let effective_threshold = match visibility {
-        Visibility::Public => Some(DistributionThreshold::Total),
+        Visibility::Public => Some(DistributionThreshold::Total {}),
         Visibility::Private => {
             if let Some(DistributionThreshold::MinMembers { count }) = distribution_threshold {
                 if count == 0 {
@@ -455,10 +478,18 @@ fn execute_create_circle(
             msg: "Payout amount overflow".to_string(),
         })?;
 
+    let cycle_secs = cycle_duration_seconds
+        .filter(|&s| s > 0)
+        .unwrap_or(cycle_duration_days as u64 * 86400);
+    if cycle_secs == 0 {
+        return Err(ContractError::InvalidParameters {
+            msg: "cycle_duration_days must be > 0, or cycle_duration_seconds must be > 0".to_string(),
+        });
+    }
+
     let end_date = start_date.map(|start| {
         Timestamp::from_seconds(
-            start.seconds()
-                + (cycle_duration_days as u64 * max_members as u64 * total_cycles as u64 * 86400),
+            start.seconds() + (cycle_secs * max_members as u64 * total_cycles as u64),
         )
     });
 
@@ -495,11 +526,13 @@ fn execute_create_circle(
         max_missed_payments_allowed: max_missed,
         total_cycles,
         cycle_duration_days,
+        cycle_duration_seconds: cycle_duration_seconds.unwrap_or(0),
         start_date,
         first_cycle_date: start_date,
         next_payout_date: start_date,
         end_date,
         grace_period_hours,
+        grace_period_seconds: grace_period_seconds.unwrap_or(0),
         auto_start_when_full,
         auto_start_type,
         auto_start_date,
@@ -616,18 +649,13 @@ fn execute_join_circle(
         });
     }
 
-    MEMBER_LOCKED_AMOUNTS.save(
+    add_member_locked(
         deps.storage,
-        (circle_id, info.sender.clone()),
-        &circle.contribution_amount,
+        circle_id,
+        &info.sender,
+        circle.contribution_amount,
+        &mut circle.total_amount_locked,
     )?;
-
-    circle.total_amount_locked = circle
-        .total_amount_locked
-        .checked_add(circle.contribution_amount)
-        .map_err(|_| ContractError::InvalidParameters {
-            msg: "Total amount overflow".to_string(),
-        })?;
 
     // Add member
     circle.members_list.push(info.sender.clone());
@@ -756,6 +784,13 @@ fn execute_exit_circle(
 ) -> Result<Response, ContractError> {
     let mut circle = CIRCLES.load(deps.storage, circle_id)?;
 
+    if circle.circle_status == CircleStatus::Cancelled {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Draft, Open, Running or Paused".to_string(),
+            actual: "Cancelled".to_string(),
+        });
+    }
+
     if !circle.members_list.contains(&info.sender) {
         return Err(ContractError::Unauthorized {
             msg: "Not a member of this circle".to_string(),
@@ -776,11 +811,13 @@ fn execute_exit_circle(
             MEMBER_LOCKED_AMOUNTS.may_load(deps.storage, (circle_id, info.sender.clone()))
         {
             refund_amount = locked;
-            MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, info.sender.clone()));
-            circle.total_amount_locked = circle
-                .total_amount_locked
-                .checked_sub(locked)
-                .unwrap_or(circle.total_amount_locked);
+            debit_member_locked(
+                deps.storage,
+                circle_id,
+                &info.sender,
+                locked,
+                &mut circle.total_amount_locked,
+            )?;
 
             if !refund_amount.is_zero() {
                 let (refund_msgs, _) = safe_refund_or_queue(
@@ -814,7 +851,6 @@ fn execute_exit_circle(
                 .range(deps.storage, None, None, Order::Ascending)
                 .filter_map(|res| res.ok().map(|(m, a)| (m, a)))
                 .collect();
-            let mut extra_refund_total = Uint128::zero();
             for (member, amount) in locked_entries {
                 if !amount.is_zero() {
                     let (refund_msgs, _) = safe_refund_or_queue(
@@ -826,15 +862,14 @@ fn execute_exit_circle(
                         &circle.denomination,
                     )?;
                     messages.extend(refund_msgs);
-                    extra_refund_total += amount;
+                    debit_member_locked(
+                        deps.storage,
+                        circle_id,
+                        &member,
+                        amount,
+                        &mut circle.total_amount_locked,
+                    )?;
                 }
-                MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member));
-            }
-            if !extra_refund_total.is_zero() {
-                circle.total_amount_locked = circle
-                    .total_amount_locked
-                    .checked_sub(extra_refund_total)
-                    .unwrap_or(Uint128::zero());
             }
             if !circle.creator_lock_amount.is_zero() {
                 let creator_amount = circle.creator_lock_amount;
@@ -887,10 +922,6 @@ fn execute_exit_circle(
             .unwrap_or(circle.total_penalties_collected);
 
         if !refund.is_zero() {
-            circle.total_amount_locked = circle
-                .total_amount_locked
-                .checked_sub(refund)
-                .unwrap_or(circle.total_amount_locked);
             let (refund_msgs, _) = safe_refund_or_queue(
                 deps.branch(),
                 &env,
@@ -904,8 +935,14 @@ fn execute_exit_circle(
 
         refund_amount = refund;
 
-        // Clean up
-        MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, info.sender.clone()));
+        // Clean up: debit full locked amount from member and aggregate
+        debit_member_locked(
+            deps.storage,
+            circle_id,
+            &info.sender,
+            locked,
+            &mut circle.total_amount_locked,
+        )?;
         MEMBER_ACCUMULATED_LATE_FEES.remove(deps.storage, (circle_id, info.sender.clone()));
 
         // Recalculate payout order without this member
@@ -965,20 +1002,15 @@ fn execute_exit_circle(
                         share = share.checked_add(remainder).unwrap_or(share);
                     }
                     if !share.is_zero() {
-                        let ep = PENDING_PAYOUTS
-                            .may_load(deps.storage, (circle_id, member.clone()))?
-                            .unwrap_or(Uint128::zero());
-                        PENDING_PAYOUTS.save(
+                        credit_pending_payout(
                             deps.storage,
-                            (circle_id, member.clone()),
-                            &(ep + share),
+                            circle_id,
+                            member,
+                            share,
+                            &mut circle.total_pending_payouts,
                         )?;
                     }
                 }
-                circle.total_pending_payouts = circle
-                    .total_pending_payouts
-                    .checked_add(circle.creator_lock_amount)
-                    .unwrap_or(circle.total_pending_payouts);
             }
             circle.creator_lock_amount = Uint128::zero();
         }
@@ -1054,13 +1086,13 @@ fn execute_start_circle(
     circle.next_payout_date = Some(start_timestamp);
 
     let total_rounds = circle.max_members * circle.total_cycles;
-    let total_duration_seconds = circle.cycle_duration_days as u64 * total_rounds as u64 * 86400;
+    let total_duration_seconds = circle.cycle_duration_secs() * total_rounds as u64;
     let end_timestamp =
         Timestamp::from_seconds(start_timestamp.seconds() + total_duration_seconds);
     circle.end_date = Some(end_timestamp);
 
     let archived_timestamp = Timestamp::from_seconds(
-        end_timestamp.seconds() + (circle.grace_period_hours as u64 * 3600),
+        end_timestamp.seconds() + circle.grace_period_secs(),
     );
 
     circle.circle_status = CircleStatus::Running;
@@ -1163,100 +1195,106 @@ fn execute_deposit_contribution(
         });
     }
 
-    // Require exactly contribution_amount — no extra for fees (fees tracked against locked amount)
+    // Last cycle member deposited for (from MEMBER_LAST_DEPOSITED_CYCLE or scan DEPOSITS for backward compat)
+    let last_deposited_cycle = MEMBER_LAST_DEPOSITED_CYCLE
+        .may_load(deps.storage, (circle_id, info.sender.clone()))?
+        .or_else(|| {
+            DEPOSITS
+                .prefix((circle_id, info.sender.clone()))
+                .range(deps.storage, None, None, Order::Descending)
+                .next()
+                .and_then(|r| r.ok())
+                .map(|(c, _)| c)
+        })
+        .unwrap_or(0);
+
+    // Rounds missed = cycles between last_deposited+1 and current-1 (inclusive)
+    let rounds_missed = circle
+        .current_cycle_index
+        .saturating_sub(last_deposited_cycle)
+        .saturating_sub(1);
+
+    let late_fee_per_round =
+        compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+
+    // If missed >= max_missed: add late fees for missed rounds, then eject, cannot deposit
+    if rounds_missed >= circle.max_missed_payments_allowed {
+        let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+        let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
+            .may_load(deps.storage, (circle_id, info.sender.clone()))?
+            .unwrap_or(Uint128::zero());
+        accumulated = accumulated
+            .checked_add(late_fee_total)
+            .unwrap_or(accumulated);
+        MEMBER_ACCUMULATED_LATE_FEES.save(
+            deps.storage,
+            (circle_id, info.sender.clone()),
+            &accumulated,
+        )?;
+
+        let orig_lock = original_lock_for_member(&circle, &info.sender);
+        if should_eject_member(
+            deps.storage,
+            circle_id,
+            &info.sender,
+            orig_lock,
+            circle.exit_penalty_percent,
+        ) {
+            eject_member_from_circle(&mut deps, &env, &mut circle, &info.sender)?;
+            CIRCLES.save(deps.storage, circle_id, &circle)?;
+        }
+        return Err(ContractError::MaxMissedPaymentsExceeded {
+            max: circle.max_missed_payments_allowed,
+        });
+    }
+
+    let late_fee_total = late_fee_per_round * Uint128::from(rounds_missed as u128);
+    let required_amount = circle
+        .contribution_amount
+        .checked_add(late_fee_total)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Required amount overflow".to_string(),
+        })?;
+
     let payment = must_pay(&info, &circle.denomination).map_err(|_| {
         ContractError::InsufficientFunds {
-            required: circle.contribution_amount.to_string(),
+            required: required_amount.to_string(),
             sent: "0".to_string(),
         }
     })?;
 
-    if payment < circle.contribution_amount {
+    if payment < required_amount {
         return Err(ContractError::InsufficientFunds {
-            required: circle.contribution_amount.to_string(),
+            required: required_amount.to_string(),
             sent: payment.to_string(),
         });
     }
 
-    // Determine if late
-    let mut is_late = false;
-    if let Some(next_payout) = circle.next_payout_date {
-        let grace_end = next_payout.plus_seconds(circle.grace_period_hours as u64 * 3600);
-        if env.block.time > grace_end {
-            is_late = true;
+    let is_late = rounds_missed > 0;
 
-            // Strict mode: in strict mode, ejection is automatic but deposit is still accepted
-            // (we record the late fee against locked amount and let CheckAndEject handle ejection)
-            let late_fee_per_round =
-                compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+    // Add late fees (paid in tokens) to pool
+    if !late_fee_total.is_zero() {
+        circle.total_penalties_collected = circle
+            .total_penalties_collected
+            .checked_add(late_fee_total)
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Penalties overflow".to_string(),
+            })?;
 
-            let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(Uint128::zero());
-            accumulated = accumulated
-                .checked_add(late_fee_per_round)
-                .unwrap_or(accumulated);
-            MEMBER_ACCUMULATED_LATE_FEES.save(
-                deps.storage,
-                (circle_id, info.sender.clone()),
-                &accumulated,
-            )?;
-
-            // Track missed payment count
-            let mut missed = MEMBER_MISSED_PAYMENTS
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(MemberMissedPayments {
-                    member: info.sender.clone(),
-                    missed_count: 0,
-                    last_missed_cycle: None,
-                });
-            missed.missed_count += 1;
-            missed.last_missed_cycle = Some(circle.current_cycle_index);
-            MEMBER_MISSED_PAYMENTS.save(
-                deps.storage,
-                (circle_id, info.sender.clone()),
-                &missed,
-            )?;
-
-            // Record late fee as penalty record for history
-            PENALTIES.save(
-                deps.storage,
-                (circle_id, info.sender.clone(), circle.current_cycle_index),
-                &PenaltyRecord {
-                    member: info.sender.clone(),
-                    cycle: circle.current_cycle_index,
-                    amount: late_fee_per_round,
-                    reason: format!(
-                        "Late payment ({}% of contribution deducted from locked amount)",
-                        circle.late_fee_percent / 100
-                    ),
-                    timestamp: env.block.time,
-                },
-            )?;
-
-            // Check ejection condition AFTER accumulating late fee
-            let locked = MEMBER_LOCKED_AMOUNTS
-                .may_load(deps.storage, (circle_id, info.sender.clone()))?
-                .unwrap_or(Uint128::zero());
-
-            if should_eject_member(
-                deps.storage,
-                circle_id,
-                &info.sender,
-                locked,
-                circle.exit_penalty_percent,
-            ) {
-                eject_member_from_circle(&mut deps, &env, &mut circle, &info.sender)?;
-                CIRCLES.save(deps.storage, circle_id, &circle)?;
-                // Deposit is rejected since member is now ejected
-                return Err(ContractError::MaxMissedPaymentsExceeded {
-                    max: circle.max_missed_payments_allowed,
-                });
-            }
-        } else if env.block.time > next_payout {
-            // Within grace period: still on-time from penalty perspective but flagged as late
-            is_late = true;
-        }
+        PENALTIES.save(
+            deps.storage,
+            (circle_id, info.sender.clone(), circle.current_cycle_index),
+            &PenaltyRecord {
+                member: info.sender.clone(),
+                cycle: circle.current_cycle_index,
+                amount: late_fee_total,
+                reason: format!(
+                    "Late deposit: {} rounds missed ({}% per round paid in tokens)",
+                    rounds_missed, circle.late_fee_percent / 100
+                ),
+                timestamp: env.block.time,
+            },
+        )?;
     }
 
     // Record deposit
@@ -1272,6 +1310,12 @@ fn execute_deposit_contribution(
         },
     )?;
 
+    MEMBER_LAST_DEPOSITED_CYCLE.save(
+        deps.storage,
+        (circle_id, info.sender.clone()),
+        &circle.current_cycle_index,
+    )?;
+
     circle.total_amount_locked = circle
         .total_amount_locked
         .checked_add(circle.contribution_amount)
@@ -1285,6 +1329,10 @@ fn execute_deposit_contribution(
         circle.members_paid_this_cycle.push(info.sender.clone());
     }
 
+    let deposited_cycle = circle.current_cycle_index;
+
+    // Rounds advance by calendar (AdvanceRound/ProcessPayout), not by deposit
+
     circle.updated_at = env.block.time;
     CIRCLES.save(deps.storage, circle_id, &circle)?;
 
@@ -1295,7 +1343,7 @@ fn execute_deposit_contribution(
         "contribution_deposited",
         &format!(
             "Member {} deposited {} for cycle {} (on_time: {})",
-            info.sender, circle.contribution_amount, circle.current_cycle_index, !is_late
+            info.sender, circle.contribution_amount, deposited_cycle, !is_late
         ),
     )?;
 
@@ -1304,7 +1352,7 @@ fn execute_deposit_contribution(
         .add_attribute("action", "deposit_contribution")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("member", info.sender)
-        .add_attribute("cycle", circle.current_cycle_index.to_string())
+        .add_attribute("cycle", deposited_cycle.to_string())
         .add_attribute("amount", circle.contribution_amount.to_string())
         .add_attribute("on_time", (!is_late).to_string());
     for msg in staking_msgs {
@@ -1329,6 +1377,18 @@ fn execute_process_payout(
         return Err(ContractError::InvalidCircleStatus {
             expected: "Running".to_string(),
             actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    // Idempotency: reject if this cycle was already processed (prevents double trigger)
+    let already_processed = PAYOUTS
+        .prefix((circle_id, circle.current_cycle_index))
+        .range(deps.storage, None, None, Order::Ascending)
+        .next()
+        .is_some();
+    if already_processed {
+        return Err(ContractError::PayoutAlreadyProcessed {
+            cycle: circle.current_cycle_index,
         });
     }
 
@@ -1374,7 +1434,7 @@ fn execute_process_payout(
 
     // If any missing and grace period still active, block payout
     if let Some(next_payout) = circle.next_payout_date {
-        let grace_end = next_payout.plus_seconds(circle.grace_period_hours as u64 * 3600);
+        let grace_end = next_payout.plus_seconds(circle.grace_period_secs());
         if env.block.time <= grace_end && !missing_members.is_empty() {
             return Err(ContractError::InvalidParameters {
                 msg: "Grace period not ended for all missing members".to_string(),
@@ -1400,6 +1460,7 @@ fn execute_process_payout(
                 member: member.clone(),
                 missed_count: 0,
                 last_missed_cycle: None,
+                last_fee_round: None,
             });
 
         if missed.last_missed_cycle != Some(circle.current_cycle_index) {
@@ -1421,34 +1482,47 @@ fn execute_process_payout(
             )?;
         }
 
-        let locked = MEMBER_LOCKED_AMOUNTS
-            .may_load(deps.storage, (circle_id, member.clone()))?
-            .unwrap_or(Uint128::zero());
-
-        // Check ejection condition
+        // Check ejection condition using ORIGINAL lock (not remaining balance)
+        let orig_lock = original_lock_for_member(&circle, member);
         if should_eject_member(
             deps.storage,
             circle_id,
             member,
-            locked,
+            orig_lock,
             circle.exit_penalty_percent,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
         }
 
-        // Use locked funds to cover missed deposit
-        let used = use_locked_amount_for_member(
-            deps.storage,
-            circle_id,
-            member,
-            circle.contribution_amount,
-        )?;
+        // Use locked funds to cover missed deposit — never use creator's lock (creator lock must stay intact)
+        let used = if member == &circle.creator_address {
+            Uint128::zero()
+        } else {
+            use_locked_amount_for_member(
+                deps.storage,
+                circle_id,
+                member,
+                circle.contribution_amount,
+            )?
+        };
         if !used.is_zero() {
             locked_used_total = locked_used_total
                 .checked_add(used)
                 .map_err(|_| ContractError::InvalidParameters {
                     msg: "Locked funds overflow".to_string(),
                 })?;
+            // Record synthetic deposit so this round remains auditable (no perceived "skipped" round).
+            DEPOSITS.save(
+                deps.storage,
+                (circle_id, member.clone(), circle.current_cycle_index),
+                &DepositRecord {
+                    member: member.clone(),
+                    cycle: circle.current_cycle_index,
+                    amount: used,
+                    timestamp: env.block.time,
+                    on_time: false,
+                },
+            )?;
         }
     }
 
@@ -1479,6 +1553,18 @@ fn execute_process_payout(
                         .map_err(|_| ContractError::InvalidParameters {
                             msg: "Locked funds overflow".to_string(),
                         })?;
+                    // Record synthetic deposit for blocked member coverage in this round.
+                    DEPOSITS.save(
+                        deps.storage,
+                        (circle_id, blocked_member.clone(), circle.current_cycle_index),
+                        &DepositRecord {
+                            member: blocked_member.clone(),
+                            cycle: circle.current_cycle_index,
+                            amount: used,
+                            timestamp: env.block.time,
+                            on_time: false,
+                        },
+                    )?;
                 }
             }
         }
@@ -1508,12 +1594,13 @@ fn execute_process_payout(
         })
         .count();
 
-    // Distribution threshold check
-    let round_in_cycle = ((circle.current_cycle_index - 1) % circle.max_members) + 1;
+    // Distribution threshold check (based on active members)
+    let active_count = active_members.len() as u32;
+    let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
     let min_round_for_distribution = match circle.distribution_threshold {
         None => 1u32,
-        Some(DistributionThreshold::Total) => circle.max_members,
-        Some(DistributionThreshold::MinMembers { count }) => count,
+        Some(DistributionThreshold::Total {}) => active_count,
+        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
     };
 
     if round_in_cycle < min_round_for_distribution {
@@ -1525,33 +1612,50 @@ fn execute_process_payout(
         });
     }
 
-    if deposits_count < active_members.len() {
+    // All active must have contributed (deposit or locked used for missing)
+    let effective_contributors = deposits_count
+        + missing_members
+            .iter()
+            .filter(|m| active_members.contains(m))
+            .count();
+    if effective_contributors < active_members.len() {
         return Err(ContractError::InvalidParameters {
             msg: format!(
-                "Not all active members have deposited: need {}, have {}",
+                "Not all active members have contributed: need {}, have {}",
                 active_members.len(),
-                deposits_count
+                effective_contributors
             ),
         });
     }
 
-    // Get recipient
-    let recipient = if let Some(ref order_list) = circle.payout_order_list {
-        let index = (circle.current_cycle_index as usize - 1) % order_list.len();
-        order_list[index].clone()
-    } else {
-        return Err(ContractError::InvalidParameters {
-            msg: "Payout order not set".to_string(),
-        });
-    };
+    // Total threshold at last round of cycle: split equally among ALL active members
+    let is_total_at_last_round = matches!(circle.distribution_threshold, Some(DistributionThreshold::Total {}))
+        && round_in_cycle == min_round_for_distribution;
 
-    // Calculate payout amount
-    let base_payout = circle
-        .contribution_amount
-        .checked_mul(Uint128::from(deposits_count as u128))
-        .map_err(|_| ContractError::InvalidParameters {
-            msg: "Payout amount overflow".to_string(),
-        })?;
+    // Calculate payout amount (total pool)
+    // For Total threshold at last round: sum from ALL rounds in the cycle. Each round: active_count * contribution
+    // (everyone contributed either by deposit or locked). Otherwise: only current round (one recipient per round).
+    let base_payout = if is_total_at_last_round {
+        let rounds_in_cycle = active_count; // Total threshold: min_round = active_count
+        let round_amount = circle
+            .contribution_amount
+            .checked_mul(Uint128::from(active_count as u128))
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Payout amount overflow".to_string(),
+            })?;
+        round_amount
+            .checked_mul(Uint128::from(rounds_in_cycle as u128))
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Payout amount overflow".to_string(),
+            })?
+    } else {
+        circle
+            .contribution_amount
+            .checked_mul(Uint128::from(deposits_count as u128))
+            .map_err(|_| ContractError::InvalidParameters {
+                msg: "Payout amount overflow".to_string(),
+            })?
+    };
 
     let mut payout_amount = base_payout
         .checked_add(locked_used_total)
@@ -1573,29 +1677,154 @@ fn execute_process_payout(
             msg: "Platform fees overflow".to_string(),
         })?;
 
-    // Record payout
-    PAYOUTS.save(
-        deps.storage,
-        (circle_id, circle.current_cycle_index),
-        &PayoutRecord {
-            cycle: circle.current_cycle_index,
-            recipient: recipient.clone(),
-            amount: payout_amount,
-            timestamp: env.block.time,
-            transaction_hash: None,
-        },
-    )?;
-
-    // Store in PENDING_PAYOUTS instead of direct BankMsg (decouples withdraw from deposit cycle)
-    let existing_pending = PENDING_PAYOUTS
-        .may_load(deps.storage, (circle_id, recipient.clone()))?
-        .unwrap_or(Uint128::zero());
-    let new_pending = existing_pending
-        .checked_add(payout_amount)
-        .map_err(|_| ContractError::InvalidParameters {
-            msg: "Pending payout overflow".to_string(),
+    let liquid_balance = deps
+        .querier
+        .query_balance(&env.contract.address, &circle.denomination)
+        .map_err(|e| ContractError::InvalidParameters {
+            msg: format!("Balance query failed: {}", e),
         })?;
-    PENDING_PAYOUTS.save(deps.storage, (circle_id, recipient.clone()), &new_pending)?;
+    // Include staked amount: funds may be delegated; process_payout only credits PENDING_PAYOUTS (no transfer)
+    let staked = CIRCLE_STAKING
+        .may_load(deps.storage, circle_id)?
+        .map(|c| c.staked_amount)
+        .unwrap_or(Uint128::zero());
+    let available = liquid_balance
+        .amount
+        .checked_add(staked)
+        .unwrap_or(liquid_balance.amount);
+
+    // Compute total we will add to PENDING_PAYOUTS and verify contract has sufficient balance
+    let mut total_to_credit = payout_amount;
+    let mut creator_refund_amount = Uint128::zero();
+    let total_rounds = circle.max_members * circle.total_cycles;
+    if circle.current_cycle_index >= total_rounds {
+        let locked_sum: Uint128 = MEMBER_LOCKED_AMOUNTS
+            .prefix(circle_id)
+            .range(deps.storage, None, None, Order::Ascending)
+            .filter_map(|r| r.ok())
+            .map(|(_, amt)| amt)
+            .fold(Uint128::zero(), |a, b| a.saturating_add(b));
+        // Add creator lock only when creator has no MEMBER_LOCKED_AMOUNTS entry.
+        // For old circles where creator lock may have been partially consumed, cap refund by available funds.
+        let creator_has_locked_entry = MEMBER_LOCKED_AMOUNTS
+            .may_load(deps.storage, (circle_id, circle.creator_address.clone()))?
+            .is_some();
+        total_to_credit = total_to_credit
+            .checked_add(locked_sum)
+            .unwrap_or(total_to_credit);
+        total_to_credit = total_to_credit
+            .checked_add(circle.total_penalties_collected)
+            .unwrap_or(total_to_credit);
+        if let Ok(Some(cfg)) = CIRCLE_STAKING.may_load(deps.storage, circle_id) {
+            total_to_credit = total_to_credit
+                .checked_add(cfg.rewards_accumulated)
+                .unwrap_or(total_to_credit);
+        }
+        if !creator_has_locked_entry && !circle.creator_lock_amount.is_zero() {
+            // Refund at most the remaining available funds after mandatory final credits.
+            creator_refund_amount = available
+                .checked_sub(total_to_credit)
+                .unwrap_or(Uint128::zero());
+            if creator_refund_amount > circle.creator_lock_amount {
+                creator_refund_amount = circle.creator_lock_amount;
+            }
+            total_to_credit = total_to_credit
+                .checked_add(creator_refund_amount)
+                .unwrap_or(total_to_credit);
+        }
+    }
+    if available < total_to_credit {
+        return Err(ContractError::InsufficientContractBalance {
+            required: total_to_credit.to_string(),
+            available: available.to_string(),
+        });
+    }
+
+    if is_total_at_last_round {
+        // Split payout_amount equally among all active members
+        let member_count = active_members.len() as u128;
+        if member_count == 0 {
+            return Err(ContractError::InvalidParameters {
+                msg: "No active members for distribution".to_string(),
+            });
+        }
+        let amount_per_member = payout_amount
+            .checked_div(Uint128::from(member_count))
+            .unwrap_or(Uint128::zero());
+        let remainder = payout_amount
+            .checked_sub(amount_per_member * Uint128::from(member_count))
+            .unwrap_or(Uint128::zero());
+
+        for (idx, member) in active_members.iter().enumerate() {
+            let mut amt = amount_per_member;
+            if idx == 0 {
+                amt = amt.checked_add(remainder).unwrap_or(amt);
+            }
+            if amt.is_zero() {
+                continue;
+            }
+
+            PAYOUTS.save(
+                deps.storage,
+                (circle_id, circle.current_cycle_index, member.clone()),
+                &PayoutRecord {
+                    cycle: circle.current_cycle_index,
+                    recipient: member.clone(),
+                    amount: amt,
+                    timestamp: env.block.time,
+                    transaction_hash: None,
+                },
+            )?;
+
+            credit_pending_payout(
+                deps.storage,
+                circle_id,
+                member,
+                amt,
+                &mut circle.total_pending_payouts,
+            )?;
+        }
+    } else {
+        // One recipient per round (MinMembers or None)
+        let recipient = if let Some(ref order_list) = circle.payout_order_list {
+            let active_order: Vec<Addr> = order_list
+                .iter()
+                .filter(|m| active_members.iter().any(|a| a == *m))
+                .cloned()
+                .collect();
+            if active_order.is_empty() {
+                return Err(ContractError::InvalidParameters {
+                    msg: "No active members in payout order".to_string(),
+                });
+            }
+            let index = (round_in_cycle as usize - 1) % active_order.len();
+            active_order[index].clone()
+        } else {
+            return Err(ContractError::InvalidParameters {
+                msg: "Payout order not set".to_string(),
+            });
+        };
+
+        PAYOUTS.save(
+            deps.storage,
+            (circle_id, circle.current_cycle_index, recipient.clone()),
+            &PayoutRecord {
+                cycle: circle.current_cycle_index,
+                recipient: recipient.clone(),
+                amount: payout_amount,
+                timestamp: env.block.time,
+                transaction_hash: None,
+            },
+        )?;
+
+        credit_pending_payout(
+            deps.storage,
+            circle_id,
+            &recipient,
+            payout_amount,
+            &mut circle.total_pending_payouts,
+        )?;
+    }
 
     // Subtract the contributed deposits from total_amount_locked (excluding locked join deposits used above — those were already deducted by use_locked_amount_for_member)
     let deposit_outflow = base_payout
@@ -1609,11 +1838,6 @@ fn execute_process_payout(
         .checked_sub(deposit_outflow)
         .unwrap_or(Uint128::zero());
 
-    circle.total_pending_payouts = circle
-        .total_pending_payouts
-        .checked_add(payout_amount)
-        .unwrap_or(circle.total_pending_payouts);
-
     circle.cycles_completed += 1;
     circle.members_paid_this_cycle.clear();
     circle.members_late_this_cycle.clear();
@@ -1621,62 +1845,88 @@ fn execute_process_payout(
     // Check if last round across all cycles
     let total_rounds = circle.max_members * circle.total_cycles;
     if circle.current_cycle_index >= total_rounds {
-        circle.circle_status = CircleStatus::Completed;
+        // Set Finalizing — Completed only when all have withdrawn (contract balance = 0)
+        circle.circle_status = CircleStatus::Finalizing;
 
-        // Final distribution: all remaining locked + penalties + staking rewards distributed equally to active members via PENDING_PAYOUTS
-        let mut remaining = circle
-            .total_amount_locked
-            .checked_add(circle.total_penalties_collected)
-            .unwrap_or(circle.total_amount_locked);
+        // Final distribution (automatic): (1) Creator gets creator_lock back (if not in MEMBER_LOCKED); (2) Each member gets their join-deposit lock back; (3) Penalties + staking split equally
+        let mut total_distributed = Uint128::zero();
+
+        // 1. Creator gets creator lock back (capped for old circles by actual available funds).
+        if !creator_refund_amount.is_zero() && active_members.iter().any(|m| m == &circle.creator_address) {
+            credit_pending_payout(
+                deps.storage,
+                circle_id,
+                &circle.creator_address,
+                creator_refund_amount,
+                &mut circle.total_pending_payouts,
+            )?;
+            total_distributed = total_distributed
+                .checked_add(creator_refund_amount)
+                .unwrap_or(total_distributed);
+        }
+        circle.creator_lock_amount = Uint128::zero();
+
+        // 2. Each member gets their own join-deposit lock back (from MEMBER_LOCKED_AMOUNTS)
+        let locked_entries: Vec<(Addr, Uint128)> = MEMBER_LOCKED_AMOUNTS
+            .prefix(circle_id)
+            .range(deps.storage, None, None, Order::Ascending)
+            .filter_map(|res| res.ok())
+            .collect();
+        for (member, locked) in &locked_entries {
+            if locked.is_zero() {
+                continue;
+            }
+            credit_pending_payout(
+                deps.storage,
+                circle_id,
+                member,
+                *locked,
+                &mut circle.total_pending_payouts,
+            )?;
+            total_distributed = total_distributed.checked_add(*locked).unwrap_or(total_distributed);
+        }
+        for (m, _) in &locked_entries {
+            MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, m.clone()));
+        }
+
+        // 3. Penalties + staking rewards split equally among all active members
+        let mut pool = circle.total_penalties_collected;
         if let Some(mut staking_cfg) = CIRCLE_STAKING.may_load(deps.storage, circle_id)? {
-            remaining = remaining
+            pool = pool
                 .checked_add(staking_cfg.rewards_accumulated)
-                .unwrap_or(remaining);
+                .unwrap_or(pool);
             staking_cfg.rewards_accumulated = Uint128::zero();
             CIRCLE_STAKING.save(deps.storage, circle_id, &staking_cfg)?;
         }
 
-        if !remaining.is_zero() && !active_members.is_empty() {
+        if !pool.is_zero() && !active_members.is_empty() {
             let member_count = Uint128::from(active_members.len() as u128);
-            let amount_per_member = remaining.multiply_ratio(1u128, member_count.u128());
-            let remainder = remaining
+            let amount_per_member = pool
+                .checked_div(member_count)
+                .unwrap_or(Uint128::zero());
+            let remainder = pool
                 .checked_sub(amount_per_member * member_count)
                 .unwrap_or(Uint128::zero());
 
             for (idx, member) in active_members.iter().enumerate() {
-                let mut bonus = amount_per_member;
+                let mut amt = amount_per_member;
                 if idx == 0 {
-                    bonus = bonus.checked_add(remainder).unwrap_or(bonus);
+                    amt = amt.checked_add(remainder).unwrap_or(amt);
                 }
-                if !bonus.is_zero() {
-                    let ep = PENDING_PAYOUTS
-                        .may_load(deps.storage, (circle_id, member.clone()))?
-                        .unwrap_or(Uint128::zero());
-                    PENDING_PAYOUTS.save(
+                if !amt.is_zero() {
+                    credit_pending_payout(
                         deps.storage,
-                        (circle_id, member.clone()),
-                        &(ep + bonus),
+                        circle_id,
+                        member,
+                        amt,
+                        &mut circle.total_pending_payouts,
                     )?;
                 }
             }
-
-            circle.total_pending_payouts = circle
-                .total_pending_payouts
-                .checked_add(remaining)
-                .unwrap_or(circle.total_pending_payouts);
-
-            // Clear locked amounts and penalties (they're now in PENDING_PAYOUTS)
-            let locked_keys: Vec<Addr> = MEMBER_LOCKED_AMOUNTS
-                .prefix(circle_id)
-                .range(deps.storage, None, None, Order::Ascending)
-                .filter_map(|res| res.ok().map(|(m, _)| m))
-                .collect();
-            for m in locked_keys {
-                MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, m));
-            }
-            circle.total_amount_locked = Uint128::zero();
-            circle.total_penalties_collected = Uint128::zero();
         }
+
+        circle.total_amount_locked = Uint128::zero();
+        circle.total_penalties_collected = Uint128::zero();
 
         log_event(
             &mut deps,
@@ -1692,7 +1942,7 @@ fn execute_process_payout(
         circle.current_cycle_index += 1;
         if let Some(current_date) = circle.next_payout_date {
             circle.next_payout_date = Some(Timestamp::from_seconds(
-                current_date.seconds() + (circle.cycle_duration_days as u64 * 86400),
+                current_date.seconds() + circle.cycle_duration_secs(),
             ));
         }
     }
@@ -1700,15 +1950,42 @@ fn execute_process_payout(
     circle.updated_at = env.block.time;
     CIRCLES.save(deps.storage, circle_id, &circle)?;
 
+    let recipient_attr = if is_total_at_last_round {
+        format!("{} members", active_members.len())
+    } else {
+        let order_list = circle.payout_order_list.as_ref().ok_or_else(|| {
+            ContractError::InvalidParameters {
+                msg: "Payout order not set".to_string(),
+            }
+        })?;
+        let active_order: Vec<Addr> = order_list
+            .iter()
+            .filter(|m| active_members.iter().any(|a| a == *m))
+            .cloned()
+            .collect();
+        let index = (round_in_cycle as usize - 1) % active_order.len();
+        active_order[index].to_string()
+    };
+    let log_msg = if is_total_at_last_round {
+        format!(
+            "Payout processed for round {} to all {} members ({} usaf total pending withdrawal)",
+            circle.cycles_completed,
+            active_members.len(),
+            payout_amount
+        )
+    } else {
+        format!(
+            "Payout processed for round {} to {} ({} usaf pending withdrawal)",
+            circle.cycles_completed, recipient_attr, payout_amount
+        )
+    };
+
     log_event(
         &mut deps,
         &env,
         circle_id,
         "payout_processed",
-        &format!(
-            "Payout processed for round {} to {} ({} usaf pending withdrawal)",
-            circle.cycles_completed, recipient, payout_amount
-        ),
+        &log_msg,
     )?;
 
     let claim_msgs = claim_staking_rewards(deps.branch(), &env, circle_id)?;
@@ -1717,7 +1994,7 @@ fn execute_process_payout(
         .add_attribute("action", "process_payout")
         .add_attribute("circle_id", circle_id.to_string())
         .add_attribute("cycle", circle.cycles_completed.to_string())
-        .add_attribute("recipient", recipient)
+        .add_attribute("recipient", recipient_attr)
         .add_attribute("amount", payout_amount.to_string())
         .add_attribute("pending_withdrawal", "true");
     for msg in claim_msgs {
@@ -1727,6 +2004,260 @@ fn execute_process_payout(
         resp = resp.add_message(msg);
     }
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Advance Round — move to next round without payout (for Total/MinMembers threshold)
+// ---------------------------------------------------------------------------
+
+fn execute_advance_round(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let mut circle = CIRCLES.load(deps.storage, circle_id)?;
+
+    if !matches!(circle.circle_status, CircleStatus::Running) {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Running".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+
+    // Authorization: manual_trigger_enabled means only creator can call (same as ProcessPayout)
+    if circle.manual_trigger_enabled && info.sender != circle.creator_address {
+        return Err(ContractError::Unauthorized {
+            msg: "Only creator can advance round (manual_trigger_enabled)".to_string(),
+        });
+    }
+
+    if let Some(next_payout) = circle.next_payout_date {
+        if env.block.time < next_payout {
+            return Err(ContractError::CycleNotReady {
+                next_date: next_payout.seconds(),
+            });
+        }
+    }
+
+    // Active members (not blocked) — used for round_in_cycle and min_round
+    let active_members: Vec<Addr> = circle
+        .members_list
+        .iter()
+        .filter(|m| {
+            BLOCKED_MEMBERS
+                .may_load(deps.storage, (circle_id, (*m).clone()))
+                .unwrap_or(None)
+                .map(|bc| bc > circle.current_cycle_index)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    if active_members.is_empty() {
+        return Err(ContractError::InvalidParameters {
+            msg: "No active members".to_string(),
+        });
+    }
+
+    let active_count = active_members.len() as u32;
+    let round_in_cycle = ((circle.current_cycle_index - 1) % active_count) + 1;
+    let min_round_for_distribution = match circle.distribution_threshold {
+        None => 1u32,
+        Some(DistributionThreshold::Total {}) => active_count,
+        Some(DistributionThreshold::MinMembers { count }) => count.min(active_count),
+    };
+
+    if round_in_cycle >= min_round_for_distribution {
+        return Err(ContractError::InvalidParameters {
+            msg: format!(
+                "AdvanceRound only when round_in_cycle < {} (current: {}). Use ProcessPayout for distribution round.",
+                min_round_for_distribution, round_in_cycle
+            ),
+        });
+    }
+
+    // Process missing members: add late fees, check ejection, use locked funds (calendar-based advance)
+    let missing_members: Vec<Addr> = active_members
+        .iter()
+        .filter(|m| {
+            DEPOSITS
+                .may_load(deps.storage, (circle_id, (*m).clone(), circle.current_cycle_index))
+                .unwrap_or(None)
+                .is_none()
+        })
+        .cloned()
+        .collect();
+
+    // Match ProcessPayout semantics: if members are still missing, do not apply
+    // missed-payment late fees before due date + grace period.
+    if let Some(next_payout) = circle.next_payout_date {
+        let grace_end = next_payout.plus_seconds(circle.grace_period_secs());
+        if env.block.time <= grace_end && !missing_members.is_empty() {
+            return Err(ContractError::InvalidParameters {
+                msg: "Grace period not ended for all missing members".to_string(),
+            });
+        }
+    }
+
+    let mut locked_used_in_advance = Uint128::zero();
+    for member in &missing_members {
+        let late_fee_per_round =
+            compute_late_fee_per_round(circle.contribution_amount, circle.late_fee_percent);
+
+        let mut accumulated = MEMBER_ACCUMULATED_LATE_FEES
+            .may_load(deps.storage, (circle_id, member.clone()))?
+            .unwrap_or(Uint128::zero());
+
+        let mut missed = MEMBER_MISSED_PAYMENTS
+            .may_load(deps.storage, (circle_id, member.clone()))?
+            .unwrap_or(MemberMissedPayments {
+                member: member.clone(),
+                missed_count: 0,
+                last_missed_cycle: None,
+                last_fee_round: None,
+            });
+
+        if missed.last_missed_cycle != Some(circle.current_cycle_index) {
+            missed.missed_count += 1;
+            missed.last_missed_cycle = Some(circle.current_cycle_index);
+            accumulated = accumulated
+                .checked_add(late_fee_per_round)
+                .unwrap_or(accumulated);
+
+            MEMBER_ACCUMULATED_LATE_FEES.save(
+                deps.storage,
+                (circle_id, member.clone()),
+                &accumulated,
+            )?;
+            MEMBER_MISSED_PAYMENTS.save(
+                deps.storage,
+                (circle_id, member.clone()),
+                &missed,
+            )?;
+        }
+
+        let orig_lock = original_lock_for_member(&circle, member);
+        if should_eject_member(
+            deps.storage,
+            circle_id,
+            member,
+            orig_lock,
+            circle.exit_penalty_percent,
+        ) {
+            eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
+        }
+
+        // Never use creator's lock — creator lock must stay intact
+        if member != &circle.creator_address {
+            let used = use_locked_amount_for_member(
+                deps.storage,
+                circle_id,
+                member,
+                circle.contribution_amount,
+            )?;
+            locked_used_in_advance = locked_used_in_advance
+                .checked_add(used)
+                .unwrap_or(locked_used_in_advance);
+            if !used.is_zero() {
+                // Record synthetic deposit to preserve round-by-round audit trail.
+                DEPOSITS.save(
+                    deps.storage,
+                    (circle_id, member.clone(), circle.current_cycle_index),
+                    &DepositRecord {
+                        member: member.clone(),
+                        cycle: circle.current_cycle_index,
+                        amount: used,
+                        timestamp: env.block.time,
+                        on_time: false,
+                    },
+                )?;
+            }
+        }
+    }
+
+    // Also use locked from previously blocked members for this round
+    let blocked_members_list: Vec<Addr> = BLOCKED_MEMBERS
+        .prefix(circle_id)
+        .range(deps.storage, None, None, Order::Ascending)
+        .filter_map(|res| res.ok().map(|(m, _)| m))
+        .collect();
+
+    for blocked_member in blocked_members_list {
+        if missing_members.iter().any(|m| m == &blocked_member) {
+            continue;
+        }
+        if let Ok(Some(bc)) =
+            BLOCKED_MEMBERS.may_load(deps.storage, (circle_id, blocked_member.clone()))
+        {
+            if bc <= circle.current_cycle_index {
+                let used = use_locked_amount_for_member(
+                    deps.storage,
+                    circle_id,
+                    &blocked_member,
+                    circle.contribution_amount,
+                )?;
+                locked_used_in_advance = locked_used_in_advance
+                    .checked_add(used)
+                    .unwrap_or(locked_used_in_advance);
+                if !used.is_zero() {
+                    // Record synthetic deposit for blocked member coverage in this round.
+                    DEPOSITS.save(
+                        deps.storage,
+                        (circle_id, blocked_member.clone(), circle.current_cycle_index),
+                        &DepositRecord {
+                            member: blocked_member.clone(),
+                            cycle: circle.current_cycle_index,
+                            amount: used,
+                            timestamp: env.block.time,
+                            on_time: false,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+
+    // Keep total_amount_locked in sync: locked used for missed deposits is no longer "locked"
+    if !locked_used_in_advance.is_zero() {
+        circle.total_amount_locked = circle
+            .total_amount_locked
+            .checked_sub(locked_used_in_advance)
+            .unwrap_or(Uint128::zero());
+    }
+
+    let total_rounds = circle.max_members * circle.total_cycles;
+    if circle.current_cycle_index >= total_rounds {
+        return Err(ContractError::InvalidParameters {
+            msg: "Circle has no more rounds to advance".to_string(),
+        });
+    }
+
+    circle.current_cycle_index += 1;
+    if let Some(current_date) = circle.next_payout_date {
+        circle.next_payout_date = Some(Timestamp::from_seconds(
+            current_date.seconds() + circle.cycle_duration_secs(),
+        ));
+    }
+
+    circle.updated_at = env.block.time;
+    CIRCLES.save(deps.storage, circle_id, &circle)?;
+
+    log_event(
+        &mut deps,
+        &env,
+        circle_id,
+        "round_advanced",
+        &format!(
+            "Advanced to round {} (no payout — distribution at round {})",
+            circle.current_cycle_index, min_round_for_distribution
+        ),
+    )?;
+
+    Ok(Response::new()
+        .add_attribute("action", "advance_round")
+        .add_attribute("circle_id", circle_id.to_string())
+        .add_attribute("new_cycle_index", circle.current_cycle_index.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,21 +2273,21 @@ fn execute_withdraw(
     // Validate circle exists
     let mut circle = CIRCLES.load(deps.storage, circle_id)?;
 
-    let pending = PENDING_PAYOUTS
-        .may_load(deps.storage, (circle_id, info.sender.clone()))?
-        .unwrap_or(Uint128::zero());
+    let pending = debit_pending_payout(
+        deps.storage,
+        circle_id,
+        &info.sender,
+        &mut circle.total_pending_payouts,
+    )?;
 
     if pending.is_zero() {
         return Err(ContractError::NoPendingPayouts {});
     }
 
-    // Clear pending payout
-    PENDING_PAYOUTS.remove(deps.storage, (circle_id, info.sender.clone()));
-
-    circle.total_pending_payouts = circle
-        .total_pending_payouts
-        .checked_sub(pending)
-        .unwrap_or(Uint128::zero());
+    // When Finalizing and this is the last withdrawal (total_pending_payouts = 0), mark Completed
+    if circle.circle_status == CircleStatus::Finalizing && circle.total_pending_payouts.is_zero() {
+        circle.circle_status = CircleStatus::Completed;
+    }
 
     circle.updated_at = env.block.time;
     CIRCLES.save(deps.storage, circle_id, &circle)?;
@@ -1806,15 +2337,12 @@ fn execute_check_and_eject(
     let mut ejected_count = 0u32;
 
     for member in &members_snapshot {
-        let locked = MEMBER_LOCKED_AMOUNTS
-            .may_load(deps.storage, (circle_id, member.clone()))?
-            .unwrap_or(Uint128::zero());
-
+        let orig_lock = original_lock_for_member(&circle, member);
         if should_eject_member(
             deps.storage,
             circle_id,
             member,
-            locked,
+            orig_lock,
             circle.exit_penalty_percent,
         ) {
             eject_member_from_circle(&mut deps, &env, &mut circle, member)?;
@@ -1872,12 +2400,35 @@ fn execute_cancel_circle(
 
     if !matches!(
         circle.circle_status,
-        CircleStatus::Draft | CircleStatus::Open | CircleStatus::Running | CircleStatus::Paused
+        CircleStatus::Draft | CircleStatus::Open | CircleStatus::Full | CircleStatus::Running | CircleStatus::Paused
     ) {
         return Err(ContractError::InvalidCircleStatus {
-            expected: "Draft, Open, Running or Paused".to_string(),
+            expected: "Draft, Open, Full, Running or Paused".to_string(),
             actual: format!("{:?}", circle.circle_status),
         });
+    }
+
+    // After at least one distribution, cancel is not allowed — circle must complete or use emergency procedures
+    if is_running {
+        let max_cycle = circle
+            .current_cycle_index
+            .max(circle.cycles_completed)
+            .max(1);
+        let mut has_distributed = false;
+        for cycle in 1..=max_cycle {
+            if PAYOUTS
+                .prefix((circle_id, cycle))
+                .range(deps.storage, None, None, Order::Ascending)
+                .next()
+                .is_some()
+            {
+                has_distributed = true;
+                break;
+            }
+        }
+        if has_distributed {
+            return Err(ContractError::CancelNotAllowedAfterDistribution {});
+        }
     }
 
     circle.circle_status = CircleStatus::Cancelled;
@@ -1914,18 +2465,13 @@ fn execute_cancel_circle(
                     share = share.checked_add(remainder).unwrap_or(share);
                 }
                 if !share.is_zero() {
-                    let ep = PENDING_PAYOUTS
-                        .may_load(deps.storage, (circle_id, member.clone()))?
-                        .unwrap_or(Uint128::zero());
-                    PENDING_PAYOUTS.save(
+                    credit_pending_payout(
                         deps.storage,
-                        (circle_id, member.clone()),
-                        &(ep + share),
+                        circle_id,
+                        member,
+                        share,
+                        &mut circle.total_pending_payouts,
                     )?;
-                    circle.total_pending_payouts = circle
-                        .total_pending_payouts
-                        .checked_add(share)
-                        .unwrap_or(circle.total_pending_payouts);
                 }
             }
         }
@@ -1948,10 +2494,6 @@ fn execute_cancel_circle(
             };
 
             if !refund.is_zero() {
-                circle.total_amount_locked = circle
-                    .total_amount_locked
-                    .checked_sub(refund)
-                    .unwrap_or(Uint128::zero());
                 let (refund_msgs, _) = safe_refund_or_queue(
                     deps.branch(),
                     &env,
@@ -1963,7 +2505,13 @@ fn execute_cancel_circle(
                 messages.extend(refund_msgs);
             }
 
-            MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member.clone()));
+            debit_member_locked(
+                deps.storage,
+                circle_id,
+                member,
+                locked,
+                &mut circle.total_amount_locked,
+            )?;
             MEMBER_ACCUMULATED_LATE_FEES.remove(deps.storage, (circle_id, member.clone()));
         }
     } else {
@@ -1974,7 +2522,6 @@ fn execute_cancel_circle(
             .filter_map(|res| res.ok().map(|(m, a)| (m, a)))
             .collect();
 
-        let mut join_refund_total = Uint128::zero();
         for (member, amount) in locked_entries {
             if !amount.is_zero() {
                 let (refund_msgs, _) = safe_refund_or_queue(
@@ -1986,16 +2533,14 @@ fn execute_cancel_circle(
                     &circle.denomination,
                 )?;
                 messages.extend(refund_msgs);
-                join_refund_total += amount;
+                debit_member_locked(
+                    deps.storage,
+                    circle_id,
+                    &member,
+                    amount,
+                    &mut circle.total_amount_locked,
+                )?;
             }
-            MEMBER_LOCKED_AMOUNTS.remove(deps.storage, (circle_id, member));
-        }
-
-        if !join_refund_total.is_zero() {
-            circle.total_amount_locked = circle
-                .total_amount_locked
-                .checked_sub(join_refund_total)
-                .unwrap_or(Uint128::zero());
         }
 
         // Refund creator lock
@@ -2162,10 +2707,10 @@ fn execute_update_circle(
 
     if matches!(
         circle.circle_status,
-        CircleStatus::Running | CircleStatus::Completed
+        CircleStatus::Running | CircleStatus::Finalizing | CircleStatus::Completed
     ) {
         return Err(ContractError::InvalidCircleStatus {
-            expected: "Not Running or Completed".to_string(),
+            expected: "Not Running, Finalizing or Completed".to_string(),
             actual: format!("{:?}", circle.circle_status),
         });
     }
@@ -2185,6 +2730,35 @@ fn execute_update_circle(
 
     Ok(Response::new()
         .add_attribute("action", "update_circle")
+        .add_attribute("circle_id", circle_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Undelegate For Withdrawals — when Finalizing with staked tokens, undelegate so they become available (after unbonding)
+// ---------------------------------------------------------------------------
+
+fn execute_undelegate_for_withdrawals(
+    deps: DepsMut,
+    env: Env,
+    _info: MessageInfo,
+    circle_id: u64,
+) -> Result<Response, ContractError> {
+    let circle = CIRCLES.load(deps.storage, circle_id)?;
+    if circle.circle_status != CircleStatus::Finalizing {
+        return Err(ContractError::InvalidCircleStatus {
+            expected: "Finalizing".to_string(),
+            actual: format!("{:?}", circle.circle_status),
+        });
+    }
+    let msgs = rebalance_staking(deps, &env, circle_id)?;
+    if msgs.is_empty() {
+        return Err(ContractError::InvalidParameters {
+            msg: "No staked tokens to undelegate".to_string(),
+        });
+    }
+    Ok(Response::new()
+        .add_messages(msgs)
+        .add_attribute("action", "undelegate_for_withdrawals")
         .add_attribute("circle_id", circle_id.to_string()))
 }
 
@@ -2496,12 +3070,14 @@ fn execute_enable_staking(
         });
     }
 
+    // Allow enable_staking in Draft so creator can configure at creation.
+    // rebalance_staking returns empty for Draft, so actual delegation only starts when circle is Open/Full/Running.
     if !matches!(
         circle.circle_status,
-        CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
+        CircleStatus::Draft | CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
     ) {
         return Err(ContractError::InvalidCircleStatus {
-            expected: "Open, Full or Running".to_string(),
+            expected: "Draft, Open, Full or Running".to_string(),
             actual: format!("{:?}", circle.circle_status),
         });
     }
@@ -2668,6 +3244,31 @@ fn rebalance_staking(
 
     let circle = CIRCLES.load(deps.storage, circle_id)?;
 
+    // Finalizing: undelegate all so pending payouts can be withdrawn (staked tokens are not spendable)
+    if circle.circle_status == CircleStatus::Finalizing {
+        if !config.staked_amount.is_zero() {
+            let mut msgs: Vec<CosmosMsg> = vec![];
+            msgs.push(CosmosMsg::Staking(StakingMsg::Undelegate {
+                validator: config.validator_address.clone(),
+                amount: Coin {
+                    denom: circle.denomination.clone(),
+                    amount: config.staked_amount,
+                },
+            }));
+            config.pending_undelegations.push(PendingUndelegation {
+                amount: config.staked_amount,
+                available_at: Timestamp::from_seconds(
+                    env.block.time.seconds() + UNBONDING_PERIOD_SECS,
+                ),
+                reason: "finalizing".to_string(),
+            });
+            config.staked_amount = Uint128::zero();
+            CIRCLE_STAKING.save(deps.storage, circle_id, &config)?;
+            return Ok(msgs);
+        }
+        return Ok(vec![]);
+    }
+
     if !matches!(
         circle.circle_status,
         CircleStatus::Open | CircleStatus::Full | CircleStatus::Running
@@ -2691,12 +3292,14 @@ fn rebalance_staking(
         return Ok(vec![]);
     }
 
-    let liquid_reserve = circle
+    let base_reserve = circle
         .payout_amount
         .checked_mul(Uint128::from(2u128))
         .map_err(|_| ContractError::InvalidParameters {
             msg: "Reserve overflow".to_string(),
         })?;
+    // Keep at least total_pending_payouts liquid so withdrawals can succeed (staked tokens are not spendable)
+    let liquid_reserve = std::cmp::max(base_reserve, circle.total_pending_payouts);
 
     let total_locked = circle.total_amount_locked;
 
@@ -2926,7 +3529,7 @@ fn generate_payout_order(circle: &mut Circle, env: &Env) {
 fn build_distribution_calendar(circle: &Circle, start_timestamp: Timestamp) -> String {
     let min_round_for_distribution: u32 = match circle.distribution_threshold {
         None => 1,
-        Some(DistributionThreshold::Total) => circle.max_members,
+        Some(DistributionThreshold::Total {}) => circle.max_members,
         Some(DistributionThreshold::MinMembers { count }) => count,
     };
 
@@ -2937,15 +3540,12 @@ fn build_distribution_calendar(circle: &Circle, start_timestamp: Timestamp) -> S
             for recipient in payout_order.iter() {
                 let round_in_cycle = ((round_number - 1) % circle.max_members) + 1;
                 let distribution_occurs = round_in_cycle >= min_round_for_distribution;
-                let round_offset_seconds =
-                    ((round_number - 1) * circle.cycle_duration_days) as u64 * 86400;
+                let round_offset_seconds = (round_number - 1) as u64 * circle.cycle_duration_secs();
                 let deposit_deadline = Timestamp::from_seconds(
                     start_timestamp.seconds() + round_offset_seconds,
                 );
                 let distribution_date = Timestamp::from_seconds(
-                    start_timestamp.seconds()
-                        + round_offset_seconds
-                        + (circle.cycle_duration_days as u64 * 86400),
+                    start_timestamp.seconds() + round_offset_seconds + circle.cycle_duration_secs(),
                 );
                 if !calendar_data.is_empty() {
                     calendar_data.push(',');
@@ -2991,6 +3591,108 @@ fn use_locked_amount_for_member(
         return Ok(used);
     }
     Ok(Uint128::zero())
+}
+
+/// Credit pending payout for a member and update circle aggregate.
+fn credit_pending_payout(
+    storage: &mut dyn Storage,
+    circle_id: u64,
+    member: &Addr,
+    amount: Uint128,
+    total_pending: &mut Uint128,
+) -> Result<(), ContractError> {
+    if amount.is_zero() {
+        return Ok(());
+    }
+    let existing = PENDING_PAYOUTS
+        .may_load(storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    let new_pending = existing
+        .checked_add(amount)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Pending payout overflow".to_string(),
+        })?;
+    PENDING_PAYOUTS.save(storage, (circle_id, member.clone()), &new_pending)?;
+    *total_pending = total_pending
+        .checked_add(amount)
+        .unwrap_or(*total_pending);
+    Ok(())
+}
+
+/// Debit pending payout for a member and update circle aggregate. Returns the amount debited.
+fn debit_pending_payout(
+    storage: &mut dyn Storage,
+    circle_id: u64,
+    member: &Addr,
+    total_pending: &mut Uint128,
+) -> Result<Uint128, ContractError> {
+    let pending = PENDING_PAYOUTS
+        .may_load(storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    if pending.is_zero() {
+        return Ok(Uint128::zero());
+    }
+    PENDING_PAYOUTS.remove(storage, (circle_id, member.clone()));
+    *total_pending = total_pending
+        .checked_sub(pending)
+        .unwrap_or(Uint128::zero());
+    Ok(pending)
+}
+
+/// Add locked amount for a member and update circle aggregate.
+fn add_member_locked(
+    storage: &mut dyn Storage,
+    circle_id: u64,
+    member: &Addr,
+    amount: Uint128,
+    total_locked: &mut Uint128,
+) -> Result<(), ContractError> {
+    if amount.is_zero() {
+        return Ok(());
+    }
+    let existing = MEMBER_LOCKED_AMOUNTS
+        .may_load(storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    let new_locked = existing
+        .checked_add(amount)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Locked amount overflow".to_string(),
+        })?;
+    MEMBER_LOCKED_AMOUNTS.save(storage, (circle_id, member.clone()), &new_locked)?;
+    *total_locked = total_locked
+        .checked_add(amount)
+        .unwrap_or(*total_locked);
+    Ok(())
+}
+
+/// Debit locked amount for a member and update circle aggregate.
+fn debit_member_locked(
+    storage: &mut dyn Storage,
+    circle_id: u64,
+    member: &Addr,
+    amount: Uint128,
+    total_locked: &mut Uint128,
+) -> Result<(), ContractError> {
+    if amount.is_zero() {
+        return Ok(());
+    }
+    let existing = MEMBER_LOCKED_AMOUNTS
+        .may_load(storage, (circle_id, member.clone()))?
+        .unwrap_or(Uint128::zero());
+    let remaining = existing
+        .checked_sub(amount)
+        .map_err(|_| ContractError::InvalidParameters {
+            msg: "Locked amount underflow".to_string(),
+        })?;
+    if remaining.is_zero() {
+        MEMBER_LOCKED_AMOUNTS.remove(storage, (circle_id, member.clone()));
+    } else {
+        MEMBER_LOCKED_AMOUNTS.save(storage, (circle_id, member.clone()), &remaining)?;
+    }
+    *total_locked = total_locked
+        .checked_sub(amount)
+        .unwrap_or(Uint128::zero());
+    Ok(())
 }
 
 fn log_event(

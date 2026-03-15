@@ -8,10 +8,45 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Check for migrate mode: ./deploy.sh migrate <network> <contract_address> [code_id] [key_name]
+# If code_id is provided, skip build/upload and use it. Otherwise build, upload, then migrate.
+# key_name: optional - must be the contract admin's key (default: mywallet)
+MIGRATE_MODE=false
+CONTRACT_TO_MIGRATE=""
+USE_EXISTING_CODE_ID=""
+MIGRATE_KEY_NAME=""
+
+if [[ "${1:-}" == "migrate" ]]; then
+    MIGRATE_MODE=true
+    shift
+    if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+        echo -e "${RED}Error: migrate requires network and contract address${NC}"
+        echo "Usage: $0 migrate [testnet|mainnet] <contract_address> [code_id] [key_name]"
+        echo "  contract_address: e.g. addr_safro1xumzh893lfa7ak5qvpwmnle5m5xp47t3suwwa9s0ydqa8d8s5faqv2jn6s"
+        echo "  code_id: optional - if provided, skip build/upload and migrate to this code ID"
+        echo "  key_name: optional - key that is the contract admin (default: mywallet)"
+        echo ""
+        echo "Note: Only the contract admin can migrate. Check admin with:"
+        echo "  safrochaind query wasm contract <contract_address> --node <rpc>"
+        exit 1
+    fi
+    NETWORK="$1"
+    CONTRACT_TO_MIGRATE="$2"
+    USE_EXISTING_CODE_ID="${3:-}"
+    MIGRATE_KEY_NAME="${4:-}"
+fi
+
 # Default values
-NETWORK="${1:-testnet}"
-KEY_NAME="${2:-mywallet}"
-ADMIN_ADDRESS="${3:-addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn}"
+NETWORK="${NETWORK:-${1:-testnet}}"
+if [[ "$MIGRATE_MODE" != "true" ]]; then
+    # Normal deploy: $1=network, $2=key_name, $3=admin_address
+    KEY_NAME="${2:-mywallet}"
+    ADMIN_ADDRESS="${3:-addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn}"
+else
+    # Migrate: $1=network, $2=contract_address, $3=code_id, $4=key_name
+    KEY_NAME="${MIGRATE_KEY_NAME:-mywallet}"
+    ADMIN_ADDRESS="addr_safro1f8a9m8r5dq046qvmm9h5eryk0fn0u7tqu6v6sn"
+fi
 PLATFORM_FEE_PERCENT="${4:-100}"  # 1% in basis points
 PLATFORM_ADDRESS="${5:-$ADMIN_ADDRESS}"
 
@@ -19,6 +54,7 @@ PLATFORM_ADDRESS="${5:-$ADMIN_ADDRESS}"
 if [[ "$NETWORK" != "testnet" && "$NETWORK" != "mainnet" ]]; then
     echo -e "${RED}Error: Network must be 'testnet' or 'mainnet'${NC}"
     echo "Usage: $0 [testnet|mainnet] [key_name] [admin_address] [platform_fee_percent] [platform_address]"
+    echo "   or: $0 migrate [testnet|mainnet] <contract_address> [code_id]"
     exit 1
 fi
 
@@ -160,7 +196,21 @@ fi
 DENOM="$FEE_DENOM"
 echo -e "Using denomination for fees: ${YELLOW}${DENOM}${NC}"
 
-# Build contract (always rebuild to ensure reference-types are disabled)
+# --- MIGRATE MODE: with existing code ID, skip build/upload ---
+if [[ "$MIGRATE_MODE" == "true" && -n "$USE_EXISTING_CODE_ID" ]]; then
+    CODE_ID="$USE_EXISTING_CODE_ID"
+    echo -e "\n${GREEN}=== Migrate Mode (using existing code ID $CODE_ID) ===${NC}"
+    echo -e "Contract to migrate: ${YELLOW}$CONTRACT_TO_MIGRATE${NC}"
+    echo -e "New code ID: ${YELLOW}$CODE_ID${NC}"
+    echo -e "Network: ${YELLOW}$NETWORK${NC}"
+    # Skip to migrate step (after the upload section)
+    SKIP_BUILD_UPLOAD=true
+else
+    SKIP_BUILD_UPLOAD=false
+fi
+
+# Build contract (skip in migrate mode with existing code ID)
+if [[ "$SKIP_BUILD_UPLOAD" != "true" ]]; then
 echo -e "\n${GREEN}[1/4] Building contract...${NC}"
 cd "$CONTRACT_DIR"
 echo "Building WASM file with reference-types disabled..."
@@ -508,6 +558,94 @@ if [[ -z "$CODE_ID" || "$CODE_ID" == "null" ]]; then
 fi
 
 echo -e "Code ID: ${GREEN}$CODE_ID${NC}"
+
+fi
+# End of SKIP_BUILD_UPLOAD block
+
+# Ensure GAS_PRICE is set (needed for migrate when we skipped build/upload)
+if [[ -z "${GAS_PRICE:-}" ]]; then
+    GAS_PRICE="0.025${DENOM}"
+fi
+
+# --- MIGRATE: upgrade existing contract to new code ---
+if [[ "$MIGRATE_MODE" == "true" && -n "$CONTRACT_TO_MIGRATE" ]]; then
+    echo -e "\n${GREEN}=== Migrating contract to new code ===${NC}"
+    echo -e "Contract: ${YELLOW}$CONTRACT_TO_MIGRATE${NC}"
+    echo -e "New code ID: ${YELLOW}$CODE_ID${NC}"
+    echo -e "Running: safrochaind tx wasm migrate $CONTRACT_TO_MIGRATE $CODE_ID '{}' --from $KEY_NAME --chain-id $CHAIN_ID --node $RPC_URL --gas auto --gas-adjustment 1.4 --gas-prices $GAS_PRICE -y"
+    echo ""
+    
+    MIGRATE_OUTPUT=$(safrochaind tx wasm migrate "$CONTRACT_TO_MIGRATE" "$CODE_ID" '{}' \
+        --from "$KEY_NAME" \
+        --chain-id "$CHAIN_ID" \
+        --node "$RPC_URL" \
+        --gas auto \
+        --gas-adjustment 1.4 \
+        --gas-prices "$GAS_PRICE" \
+        -y \
+        --output json 2>&1)
+    MIGRATE_EXIT=$?
+    
+    echo "$MIGRATE_OUTPUT"
+    
+    if [[ $MIGRATE_EXIT -ne 0 ]] || echo "$MIGRATE_OUTPUT" | grep -qi "unauthorized"; then
+        echo -e "\n${RED}Migration failed.${NC}"
+        if echo "$MIGRATE_OUTPUT" | grep -qi "unauthorized"; then
+            echo -e "${YELLOW}Only the contract admin can migrate. Check who the admin is:${NC}"
+            echo -e "  safrochaind query wasm contract $CONTRACT_TO_MIGRATE --node $RPC_URL"
+            echo -e "${YELLOW}Then run migrate with the key that matches the admin address.${NC}"
+            echo -e "  $0 migrate $NETWORK $CONTRACT_TO_MIGRATE $CODE_ID <admin_key_name>"
+        fi
+        exit 1
+    fi
+    
+    MIGRATE_TXHASH=$(echo "$MIGRATE_OUTPUT" | grep -E '^\{.*\}$' | tail -1 | jq -r '.txhash // empty' 2>/dev/null)
+    if [[ -z "$MIGRATE_TXHASH" ]]; then
+        MIGRATE_TXHASH=$(echo "$MIGRATE_OUTPUT" | grep -oE '[A-F0-9]{64}' | head -1)
+    fi
+    
+    if [[ -n "$MIGRATE_TXHASH" ]]; then
+        echo -e "\n${GREEN}Migration submitted! TX: $MIGRATE_TXHASH${NC}"
+        echo -e "${YELLOW}Waiting for confirmation...${NC}"
+        sleep 5
+        for i in $(seq 1 15); do
+            TX_RESULT=$(safrochaind query tx "$MIGRATE_TXHASH" --node "$RPC_URL" --output json 2>/dev/null)
+            if [[ -n "$TX_RESULT" ]]; then
+                TX_CODE=$(echo "$TX_RESULT" | jq -r '.code' 2>/dev/null)
+                if [[ "$TX_CODE" == "0" ]]; then
+                    echo -e "${GREEN}Migration successful!${NC}"
+                    break
+                else
+                    echo -e "${RED}Migration failed: ${TX_RESULT}${NC}"
+                    exit 1
+                fi
+            fi
+            sleep 2
+        done
+    else
+        echo -e "${RED}Could not extract migration tx hash${NC}"
+        exit 1
+    fi
+    
+    echo -e "\n${GREEN}=== Migrate Summary ===${NC}"
+    echo -e "Contract: ${YELLOW}$CONTRACT_TO_MIGRATE${NC}"
+    echo -e "Migrated to code ID: ${GREEN}$CODE_ID${NC}"
+    echo -e "TX: ${YELLOW}$MIGRATE_TXHASH${NC}"
+    
+    # Still update frontend config so new circles use this code
+    if [[ "$SKIP_BUILD_UPLOAD" == "true" ]]; then
+        echo -e "\n${YELLOW}Note: Frontend config not updated (used existing code ID). Update codeId manually if needed.${NC}"
+    else
+        # Fall through to config update below
+        :
+    fi
+fi
+
+# Skip config update in migrate-only mode (when we used existing code ID)
+if [[ "$MIGRATE_MODE" == "true" && "$SKIP_BUILD_UPLOAD" == "true" ]]; then
+    echo -e "\n${GREEN}Done.${NC}"
+    exit 0
+fi
 
 # Note: Contract instantiation will be done by the frontend
 # Each user's circle will create a new instance of the smart contract
